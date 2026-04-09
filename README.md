@@ -1,9 +1,9 @@
-# ORB Backtester v1.2 (NASDAQ Focus)
+# ORB Backtester v1.3 (SP500 Focus)
 
 ## Obiettivo
-Questa versione 1.2 mantiene l'engine ORB estendibile a piu mercati, ma concentra i test principali su NASDAQ.
+Questa versione 1.3 mantiene l'engine ORB estendibile a piu mercati, ma concentra i test principali su SP500.
 
-## Logica ORB v1.2
+## Logica ORB v1.3
 - Timezone ufficiale: America/New_York.
 - Opening range: candela M15 09:30-09:45 NY (ricostruita da dati 5m).
 - Breakout confermato su M5:
@@ -13,16 +13,37 @@ Questa versione 1.2 mantiene l'engine ORB estendibile a piu mercati, ma concentr
 - Stop loss: lato opposto dell'opening range.
 - Take profit: RR fisso 1:1.
 - Max trade giornalieri: configurabile, default 2.
+- Filtro ORB range class testabile da CLI.
 
-## Scenari principali v1.2
+## Scenari principali v1.3
 Gli scenari principali predefiniti sono:
-- force close: no_time_close, time_close_1200
+- market: SP500
+- force close: no_time_close
 - breakout windows:
-  - breakout_window_0945_1100
-  - breakout_window_0945_1030
   - breakout_window_0945_1000
+  - breakout_window_0945_1030
+- ORB range filter: all
 
-Nota: time_close_1600 resta supportato a CLI ma declassato (non principale).
+Nota: altri mercati, 12:00/16:00 e filtri multipli restano supportati via CLI.
+
+## Filtro ORB range class
+La classe ORB range (small/medium/large) non e piu solo diagnostica: puo diventare un filtro operativo.
+
+Valori supportati per --orb-range-filters:
+- all
+- small
+- medium
+- large
+- small+medium
+- medium+large
+- small+large
+- small+large
+
+Interpretazione:
+- un filtro include solo i trade la cui orb_range_class appartiene al set richiesto.
+- con all, nessun trade viene escluso.
+
+La classificazione usa quantili su orb_range_pct_of_entry ed e centralizzata in una funzione dedicata in backtest.
 
 ## Nuove diagnostiche per trade (CSV)
 Nel file trades vengono inclusi campi aggiuntivi:
@@ -60,6 +81,7 @@ In piu:
 - distribuzione trades per fascia oraria breakout
 - performance per fascia oraria breakout
 - performance per classe ORB range
+- confronto per orb_range_filter nella tabella finale
 
 ## Output in /outputs
 Per ogni mercato/scenario:
@@ -70,28 +92,29 @@ Per ogni mercato/scenario:
 - orb_range_stats_<market>_<scenario>.csv
 
 Esempio scenario label:
-- breakout_window_0945_1100_no_time_close
-- breakout_window_0945_1000_time_close_1200
+- breakout_window_0945_1000_no_time_close_orb_all
+- breakout_window_0945_1000_no_time_close_orb_small
+- breakout_window_0945_1030_no_time_close_orb_small_plus_medium
 
 ## Comandi CLI
-Esecuzione base (focus NASDAQ):
+Esecuzione base (focus SP500):
 ```bash
 python main.py
 ```
 
-NASDAQ, scenari principali v1.2:
+SP500 con varianti filtro ORB:
 ```bash
-python main.py --period 60d --interval 5m --markets NASDAQ --force-close-options none,12:00 --breakout-windows 11:00,10:30,10:00
+python main.py --period 60d --interval 5m --markets SP500 --force-close-options none --breakout-windows 10:00,10:30 --orb-range-filters all,small,medium,large,small+medium,medium+large
 ```
 
-Aggiungere anche SP500:
+Confronto multi-market mantenendo la stessa logica:
 ```bash
 python main.py --period 60d --interval 5m --markets NASDAQ,SP500 --force-close-options none,12:00 --breakout-windows 11:00,10:30,10:00
 ```
 
-Includere opzionalmente 16:00 (scenario secondario):
+Includere opzionalmente 16:00:
 ```bash
-python main.py --period 60d --interval 5m --markets NASDAQ --force-close-options none,12:00,16:00 --breakout-windows 11:00,10:30,10:00
+python main.py --period 60d --interval 5m --markets SP500 --force-close-options none,12:00,16:00 --breakout-windows 10:00,10:30 --orb-range-filters all,small+medium
 ```
 
 Cambiare soglie classi ORB range:
@@ -105,3 +128,4 @@ python main.py --orb-range-quantiles 0.25,0.75
 - timezone: conversione coerente a New York.
 - NaN dati OHLC: righe eliminate e conteggiate in diagnostica.
 - risk non valido (entry/stop incoerenti): trade scartato e conteggiato.
+- filtri ORB restrittivi: output coerenti anche con zero trade.

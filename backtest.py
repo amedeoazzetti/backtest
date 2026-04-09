@@ -9,7 +9,7 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 
-from config import ORBRangeClassConfig, ScenarioConfig
+from config import ORBRangeClassConfig, ORBRangeClassResult, ScenarioConfig
 from strategy import ORBConfig, OpeningRangeBreakoutStrategy
 
 
@@ -19,6 +19,7 @@ class MarketBacktestResult:
     scenario_label: str
     force_close_label: str
     breakout_window_label: str
+    orb_range_filter_label: str
     trades: pd.DataFrame
     metrics: dict
     equity_curve: pd.DataFrame
@@ -62,12 +63,18 @@ def _max_drawdown_pct(equity_curve: pd.DataFrame) -> float:
     return float(drawdowns.min())
 
 
-def _classify_orb_range(
+def classify_orb_range(
     trades: pd.DataFrame,
     range_config: ORBRangeClassConfig,
-) -> tuple[pd.DataFrame, dict]:
+) -> tuple[pd.DataFrame, ORBRangeClassResult]:
+    """Classifica ORB range in small/medium/large usando quantili su orb_range_pct_of_entry."""
     if trades.empty:
-        return trades.copy(), {"lower": None, "upper": None, "method": "quantile_pct_of_entry"}
+        return trades.copy(), ORBRangeClassResult(
+            lower=None,
+            upper=None,
+            method="quantile_pct_of_entry",
+            quantiles=(range_config.lower_quantile, range_config.upper_quantile),
+        )
 
     out = trades.copy()
     metric_col = "orb_range_pct_of_entry"
@@ -76,14 +83,24 @@ def _classify_orb_range(
     valid = metric_values.dropna()
     if len(valid) < 3:
         out["orb_range_class"] = "medium"
-        return out, {"lower": None, "upper": None, "method": "fallback_medium"}
+        return out, ORBRangeClassResult(
+            lower=None,
+            upper=None,
+            method="fallback_medium",
+            quantiles=(range_config.lower_quantile, range_config.upper_quantile),
+        )
 
     lower_thr = float(valid.quantile(range_config.lower_quantile))
     upper_thr = float(valid.quantile(range_config.upper_quantile))
 
     if lower_thr >= upper_thr:
         out["orb_range_class"] = "medium"
-        return out, {"lower": lower_thr, "upper": upper_thr, "method": "fallback_medium_equal_threshold"}
+        return out, ORBRangeClassResult(
+            lower=lower_thr,
+            upper=upper_thr,
+            method="fallback_medium_equal_threshold",
+            quantiles=(range_config.lower_quantile, range_config.upper_quantile),
+        )
 
     out["orb_range_class"] = np.select(
         [metric_values < lower_thr, metric_values > upper_thr],
@@ -91,12 +108,25 @@ def _classify_orb_range(
         default="medium",
     )
 
-    return out, {
-        "lower": lower_thr,
-        "upper": upper_thr,
-        "method": "quantile_pct_of_entry",
-        "quantiles": [range_config.lower_quantile, range_config.upper_quantile],
-    }
+    return out, ORBRangeClassResult(
+        lower=lower_thr,
+        upper=upper_thr,
+        method="quantile_pct_of_entry",
+        quantiles=(range_config.lower_quantile, range_config.upper_quantile),
+    )
+
+
+def _apply_orb_range_filter(
+    trades: pd.DataFrame,
+    allowed_classes: frozenset[str] | None,
+) -> tuple[pd.DataFrame, int]:
+    if trades.empty or allowed_classes is None:
+        return trades.copy(), 0
+
+    mask = trades["orb_range_class"].isin(allowed_classes)
+    filtered = trades.loc[mask].copy()
+    skipped = int((~mask).sum())
+    return filtered, skipped
 
 
 def _build_breakout_time_stats(trades: pd.DataFrame) -> pd.DataFrame:
@@ -197,6 +227,7 @@ def _compute_metrics(
             "trades_by_breakout_hour": {},
             "breakout_hour_performance": {},
             "orb_range_class_performance": {},
+            "note": "no_trades_for_selected_scenario_or_filter",
         }
         return metrics, pd.DataFrame(columns=["time", "equity"])
 
@@ -256,6 +287,7 @@ def _compute_metrics(
             orb_range_stats,
             "orb_range_class",
         ),
+        "note": None,
     }
 
     return metrics, equity_curve
@@ -281,7 +313,8 @@ def run_market_backtest(
     trades, diagnostics = strategy.run(df)
 
     trades = _ensure_datetime_columns(trades)
-    trades, range_thresholds = _classify_orb_range(trades, orb_range_class_config)
+    trades, range_thresholds = classify_orb_range(trades, orb_range_class_config)
+    trades, skipped_by_filter = _apply_orb_range_filter(trades, scenario.allowed_orb_range_classes)
 
     breakout_time_stats = _build_breakout_time_stats(trades)
     orb_range_stats = _build_orb_range_stats(trades)
@@ -298,15 +331,28 @@ def run_market_backtest(
     metrics["scenario"] = scenario.scenario_label
     metrics["force_close"] = scenario.force_close_label
     metrics["breakout_window"] = scenario.breakout_window_label
-    metrics["orb_range_class_thresholds"] = range_thresholds
+    metrics["orb_range_filter"] = scenario.orb_range_filter_label
+    metrics["orb_range_class_thresholds"] = {
+        "lower": range_thresholds.lower,
+        "upper": range_thresholds.upper,
+        "method": range_thresholds.method,
+        "quantiles": list(range_thresholds.quantiles) if range_thresholds.quantiles else None,
+    }
+    metrics["filtered_out_trades_by_orb_filter"] = skipped_by_filter
 
-    diagnostics = {**diagnostics, "scenario": scenario.scenario_label}
+    diagnostics = {
+        **diagnostics,
+        "scenario": scenario.scenario_label,
+        "orb_range_filter": scenario.orb_range_filter_label,
+        "filtered_out_trades_by_orb_filter": skipped_by_filter,
+    }
 
     return MarketBacktestResult(
         market=scenario.market_label,
         scenario_label=scenario.scenario_label,
         force_close_label=scenario.force_close_label,
         breakout_window_label=scenario.breakout_window_label,
+        orb_range_filter_label=scenario.orb_range_filter_label,
         trades=trades,
         metrics=metrics,
         equity_curve=equity_curve,
@@ -323,7 +369,10 @@ def format_market_report(result: MarketBacktestResult) -> str:
         f"MARKET: {result.market} | SCENARIO: {result.scenario_label}",
         "=" * 90,
         f"Trades: {m['total_trades']} (LONG: {m['long_trades']} / SHORT: {m['short_trades']})",
-        f"Window: {result.breakout_window_label} | Force close: {result.force_close_label}",
+        (
+            f"Window: {result.breakout_window_label} | Force close: {result.force_close_label} | "
+            f"ORB filter: {result.orb_range_filter_label}"
+        ),
         f"Exit reason -> TP: {m['tp_hits']} | SL: {m['sl_hits']} | TIME_CLOSE: {m['time_close_hits']}",
         f"Win rate: {m['win_rate']:.2f}% | Loss rate: {m['loss_rate']:.2f}%",
         f"Profit factor: {m['profit_factor']:.4f}",
@@ -337,7 +386,8 @@ def format_market_report(result: MarketBacktestResult) -> str:
             f"ambiguous_signal_candles: {result.diagnostics.get('ambiguous_signal_candles', 0)}, "
             f"invalid_risk_entries: {result.diagnostics.get('invalid_risk_entries', 0)}, "
             f"days_missing_orb: {result.diagnostics.get('days_missing_orb', 0)}, "
-            f"rows_dropped_nan: {result.diagnostics.get('rows_dropped_nan', 0)}"
+            f"rows_dropped_nan: {result.diagnostics.get('rows_dropped_nan', 0)}, "
+            f"filtered_out_by_orb_filter: {result.diagnostics.get('filtered_out_trades_by_orb_filter', 0)}"
         ),
     ]
 
@@ -363,6 +413,7 @@ def performance_per_market(results: list[MarketBacktestResult]) -> pd.DataFrame:
         "scenario",
         "breakout_window",
         "force_close",
+        "orb_range_filter",
         "total_trades",
         "win_rate",
         "profit_factor",
@@ -383,6 +434,7 @@ def performance_per_market(results: list[MarketBacktestResult]) -> pd.DataFrame:
                 "scenario": result.scenario_label,
                 "breakout_window": result.breakout_window_label,
                 "force_close": result.force_close_label,
+                "orb_range_filter": result.orb_range_filter_label,
                 "total_trades": metrics["total_trades"],
                 "win_rate": metrics["win_rate"],
                 "profit_factor": metrics["profit_factor"],
@@ -393,4 +445,8 @@ def performance_per_market(results: list[MarketBacktestResult]) -> pd.DataFrame:
             }
         )
 
-    return pd.DataFrame(rows).sort_values(["market", "breakout_window", "force_close"]).reset_index(drop=True)
+    return (
+        pd.DataFrame(rows)
+        .sort_values(["market", "breakout_window", "force_close", "orb_range_filter"])
+        .reset_index(drop=True)
+    )
