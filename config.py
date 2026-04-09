@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import time
+import math
 from typing import Optional
 
 
@@ -17,11 +18,11 @@ MARKET_LABELS = {
 
 DEFAULT_MARKETS = "SP500"
 DEFAULT_FORCE_CLOSE_OPTIONS = "none"
-DEFAULT_BREAKOUT_WINDOWS = "10:00,10:30"
+DEFAULT_BREAKOUT_WINDOWS = "10:30"
 DEFAULT_ORB_RANGE_FILTERS = "small,small+large"
+DEFAULT_RR_TARGETS = "1.0,1.5,2.0,3.0"
 
 PRIMARY_FOCUS_BREAKOUT_WINDOWS = {
-    "breakout_window_0945_1000",
     "breakout_window_0945_1030",
 }
 PRIMARY_FOCUS_ORB_FILTERS = {"small", "small+large"}
@@ -57,6 +58,7 @@ class ScenarioConfig:
     force_close_time: Optional[time]
     breakout_window_end: time
     orb_range_filter: ORBRangeFilterConfig
+    rr_target: float
 
     @property
     def force_close_label(self) -> str:
@@ -79,10 +81,14 @@ class ScenarioConfig:
         return self.orb_range_filter.allowed_classes
 
     @property
+    def rr_target_label(self) -> str:
+        return rr_target_label(self.rr_target)
+
+    @property
     def scenario_label(self) -> str:
         return (
             f"{self.breakout_window_label}_{self.force_close_label}_"
-            f"orb_{self.orb_range_filter_slug}"
+            f"orb_{self.orb_range_filter_slug}_{self.rr_target_label}"
         )
 
 
@@ -90,6 +96,46 @@ class ScenarioConfig:
 class ORBRangeClassConfig:
     lower_quantile: float = 0.33
     upper_quantile: float = 0.66
+
+
+def rr_target_slug(rr_target: float) -> str:
+    formatted = f"{rr_target:.4f}".rstrip("0").rstrip(".")
+    if "." not in formatted:
+        formatted = f"{formatted}.0"
+    return formatted.replace(".", "_")
+
+
+def rr_target_label(rr_target: float) -> str:
+    return f"rr_{rr_target_slug(rr_target)}"
+
+
+def parse_rr_targets(raw_targets: str) -> list[float]:
+    targets: list[float] = []
+    for token in raw_targets.split(","):
+        value = token.strip()
+        if not value:
+            continue
+
+        try:
+            parsed = float(value)
+        except Exception as exc:
+            raise ValueError(f"RR target non valido: {token}") from exc
+
+        if not math.isfinite(parsed) or parsed <= 0:
+            raise ValueError(f"RR target non valido: {token}. Deve essere > 0")
+
+        targets.append(parsed)
+
+    if not targets:
+        raise ValueError("Nessun rr target valido specificato.")
+
+    unique: list[float] = []
+    seen = set()
+    for item in targets:
+        if item not in seen:
+            unique.append(item)
+            seen.add(item)
+    return unique
 
 
 def _normalize_orb_filter_item(raw_item: str) -> str:
@@ -267,6 +313,7 @@ def build_market_scenarios(
     force_close_options: list[Optional[time]],
     breakout_windows: list[time],
     orb_range_filters: list[ORBRangeFilterConfig],
+    rr_targets: list[float],
 ) -> list[ScenarioConfig]:
     market_label = MARKET_LABELS[market_code]
     symbol = MARKET_SYMBOLS[market_code]
@@ -275,15 +322,17 @@ def build_market_scenarios(
     for breakout_window_end in breakout_windows:
         for force_close_time in force_close_options:
             for orb_range_filter in orb_range_filters:
-                scenarios.append(
-                    ScenarioConfig(
-                        market_code=market_code,
-                        market_label=market_label,
-                        symbol=symbol,
-                        force_close_time=force_close_time,
-                        breakout_window_end=breakout_window_end,
-                        orb_range_filter=orb_range_filter,
+                for rr_target in rr_targets:
+                    scenarios.append(
+                        ScenarioConfig(
+                            market_code=market_code,
+                            market_label=market_label,
+                            symbol=symbol,
+                            force_close_time=force_close_time,
+                            breakout_window_end=breakout_window_end,
+                            orb_range_filter=orb_range_filter,
+                            rr_target=rr_target,
+                        )
                     )
-                )
 
     return scenarios

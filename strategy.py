@@ -25,6 +25,7 @@ TRADE_COLUMNS = [
     "date",
     "market",
     "direction",
+    "rr_target",
     "breakout_window_label",
     "orb_high",
     "orb_low",
@@ -64,6 +65,7 @@ class ORBConfig:
     signal_start: time = time(9, 45)
     signal_end: time = time(11, 0)
     breakout_window_label: Optional[str] = None
+    rr_target: float = 1.0
     max_trades_per_day: int = 2
     force_close_time: Optional[time] = None
 
@@ -73,6 +75,7 @@ class TradeRecord:
     date: str
     market: str
     direction: str
+    rr_target: float
     breakout_window_label: str
     orb_high: float
     orb_low: float
@@ -105,9 +108,33 @@ class TradeRecord:
         return asdict(self)
 
 
+def compute_take_profit(
+    entry_price: float,
+    stop_loss: float,
+    direction: str,
+    rr_target: float,
+) -> float:
+    """Calcola TP come multiplo del rischio rispetto all'entry."""
+    if rr_target <= 0:
+        raise ValueError("rr_target deve essere > 0")
+
+    if direction == "LONG":
+        risk = entry_price - stop_loss
+        return entry_price + (risk * rr_target)
+
+    if direction == "SHORT":
+        risk = stop_loss - entry_price
+        return entry_price - (risk * rr_target)
+
+    raise ValueError(f"Direzione non valida per TP: {direction}")
+
+
 class OpeningRangeBreakoutStrategy:
     def __init__(self, config: ORBConfig):
         self.config = config
+        if not math.isfinite(config.rr_target) or config.rr_target <= 0:
+            raise ValueError("rr_target deve essere un numero finito > 0")
+
         self.ny_tz = ZoneInfo(config.timezone)
         self.breakout_window_label = config.breakout_window_label or (
             f"breakout_window_{config.signal_start.strftime('%H%M')}_{config.signal_end.strftime('%H%M')}"
@@ -232,7 +259,12 @@ class OpeningRangeBreakoutStrategy:
             self.invalid_risk_entries += 1
             return False
 
-        take_profit = entry_price + risk
+        take_profit = compute_take_profit(
+            entry_price=entry_price,
+            stop_loss=stop_loss,
+            direction="LONG",
+            rr_target=self.config.rr_target,
+        )
         orb_range_points = float(self.orb_range)
         orb_range_pct_of_entry = (
             (orb_range_points / entry_price) * 100.0
@@ -248,7 +280,7 @@ class OpeningRangeBreakoutStrategy:
             "take_profit": float(take_profit),
             "breakout_candle_time": breakout_candle_time,
             "risk_points": float(risk),
-            "reward_points": float(risk),
+            "reward_points": float(risk * self.config.rr_target),
             "orb_high": float(self.orb_high),
             "orb_low": float(self.orb_low),
             "orb_range": float(self.orb_range),
@@ -259,6 +291,7 @@ class OpeningRangeBreakoutStrategy:
                 self.day_touch_upper and self.day_touch_lower
             ),
             "breakout_window_label": self.breakout_window_label,
+            "rr_target": float(self.config.rr_target),
         }
         self.trade_count += 1
         self.direction_taken = "LONG"
@@ -282,7 +315,12 @@ class OpeningRangeBreakoutStrategy:
             self.invalid_risk_entries += 1
             return False
 
-        take_profit = entry_price - risk
+        take_profit = compute_take_profit(
+            entry_price=entry_price,
+            stop_loss=stop_loss,
+            direction="SHORT",
+            rr_target=self.config.rr_target,
+        )
         orb_range_points = float(self.orb_range)
         orb_range_pct_of_entry = (
             (orb_range_points / entry_price) * 100.0
@@ -298,7 +336,7 @@ class OpeningRangeBreakoutStrategy:
             "take_profit": float(take_profit),
             "breakout_candle_time": breakout_candle_time,
             "risk_points": float(risk),
-            "reward_points": float(risk),
+            "reward_points": float(risk * self.config.rr_target),
             "orb_high": float(self.orb_high),
             "orb_low": float(self.orb_low),
             "orb_range": float(self.orb_range),
@@ -309,6 +347,7 @@ class OpeningRangeBreakoutStrategy:
                 self.day_touch_upper and self.day_touch_lower
             ),
             "breakout_window_label": self.breakout_window_label,
+            "rr_target": float(self.config.rr_target),
         }
         self.trade_count += 1
         self.direction_taken = "SHORT"
@@ -346,6 +385,7 @@ class OpeningRangeBreakoutStrategy:
             date=str(trade["entry_time"].date()),
             market=self.config.market,
             direction=direction,
+            rr_target=float(trade["rr_target"]),
             breakout_window_label=str(trade["breakout_window_label"]),
             orb_high=float(trade["orb_high"]),
             orb_low=float(trade["orb_low"]),

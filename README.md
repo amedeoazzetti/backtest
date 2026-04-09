@@ -1,67 +1,58 @@
-# ORB Backtester v1.4 (Directional and Minute Analytics)
+# ORB Backtester v1.5 (RR Targets)
 
 ## Obiettivo
-La v1.4 non introduce nuove regole di trading. Estende la parte analitica per capire meglio l'edge nelle configurazioni piu promettenti.
+La v1.5 mantiene invariata la logica di trading ORB e introduce il test multi-target RR.
 
-Focus principale:
+Focus operativo principale:
 - market: SP500
 - force close: no_time_close
-- breakout windows: 10:00, 10:30
-- ORB range filters: small, small+large
+- breakout window: 10:30
+- orb filters: small, small+large
+- rr targets: 1.0, 1.5, 2.0, 3.0
 
 ## Logica Trading (invariata)
-- Timezone ufficiale: America/New_York
-- Opening range: candela M15 09:30-09:45 NY (ricostruita da 5m)
+- Timezone: America/New_York
+- Opening range: candela 09:30-09:45 (M15 ricostruita da 5m)
 - Breakout confermato su M5
-- Entry: apertura candela successiva
-- Stop loss: lato opposto dell'opening range
-- Take profit: RR fisso 1:1
+- Entry su open candela successiva
+- Stop loss sul lato opposto del range
 
-## Filtro ORB Range Class
-Filtri supportati da CLI:
-- all
-- small
-- medium
-- large
-- small+medium
-- medium+large
-- small+large
+## RR Target Configurabile
+Nuovo parametro CLI:
+- --rr-targets 1.0,1.5,2.0,3.0
 
-Il filtro non cambia la logica dei trade: limita solo i trade considerati nel report dello scenario.
+Ogni RR richiesto genera uno scenario separato.
 
-## Nuove Analisi v1.4
-### 1. Breakdown Direzionale
-Per ogni scenario vengono calcolate metriche separate per:
-- BOTH (totale)
-- LONG
-- SHORT
+Calcolo TP:
+- LONG:
+  - risk = entry_price - stop_loss
+  - take_profit = entry_price + risk * rr_target
+- SHORT:
+  - risk = stop_loss - entry_price
+  - take_profit = entry_price - risk * rr_target
 
-Metriche per ciascun lato:
-- total_trades
-- win_rate
-- profit_factor
-- average_win
-- average_loss
-- expectancy
-- average_r
-- total_r
-- max_drawdown
-- final_equity
+Regole di validazione:
+- rr_target deve essere numerico, finito e > 0
+- input non valido produce errore esplicito senza crash runtime
 
-### 2. Breakdown per Breakout Minute
-Ogni trade include:
-- breakout_minute_bucket (es. 09:45, 09:50, 09:55, 10:00...)
+## Scenario Naming con RR
+Il nome scenario include sempre il RR:
+- breakout_window_0945_1030_no_time_close_orb_small_rr_1_0
+- breakout_window_0945_1030_no_time_close_orb_small_rr_1_5
+- breakout_window_0945_1030_no_time_close_orb_small_rr_2_0
+- breakout_window_0945_1030_no_time_close_orb_small_rr_3_0
 
-Report aggregato per minuto:
-- total_trades
-- win_rate
-- average_r
-- total_r
-- profit_factor (quando calcolabile)
-- note (low_sample per bucket con pochi casi)
+## Trade Log
+Ogni trade include anche:
+- rr_target
+
+Restano coerenti anche:
+- risk_points
+- reward_points
+- result_r
 
 ## Output in /outputs
-Per ogni scenario:
+Per ogni scenario RR:
 - trades_<market>_<scenario>.csv
 - metrics_<market>_<scenario>.json
 - equity_<market>_<scenario>.csv
@@ -71,12 +62,22 @@ Per ogni scenario:
 - orb_range_stats_<market>_<scenario>.csv
 
 Esempio:
-- trades_sp500_breakout_window_0945_1030_no_time_close_orb_small_plus_large.csv
-- direction_stats_sp500_breakout_window_0945_1030_no_time_close_orb_small_plus_large.csv
-- breakout_minute_stats_sp500_breakout_window_0945_1030_no_time_close_orb_small_plus_large.csv
+- trades_sp500_breakout_window_0945_1030_no_time_close_orb_small_rr_2_0.csv
+- metrics_sp500_breakout_window_0945_1030_no_time_close_orb_small_rr_2_0.json
+- equity_sp500_breakout_window_0945_1030_no_time_close_orb_small_rr_2_0.csv
 
 ## Tabella Finale
-La tabella di riepilogo include anche:
+Include almeno:
+- rr_target
+- total_trades
+- win_rate
+- profit_factor
+- average_r
+- total_r
+- max_drawdown
+- final_equity
+
+E mantiene anche:
 - long_trades
 - short_trades
 - long_avg_r
@@ -86,28 +87,18 @@ La tabella di riepilogo include anche:
 
 ## Robustezza
 Gestione edge cases:
-- filtro che produce zero trade
-- nessun LONG o nessun SHORT
-- pochi trade per breakout minute
+- rr_target non valido
+- scenari senza trade
 - metriche non calcolabili
+- output vuoti ma coerenti
+- NaN/missing su dati OHLC
 
-In questi casi:
-- il programma non va in crash
-- i file vengono comunque salvati
-- i report riportano note esplicative (es. no_trades, low_sample)
+## Comandi CLI Consigliati
+Focus v1.5:
+python main.py --period 60d --interval 5m --markets SP500 --force-close-options none --breakout-windows 10:30 --orb-range-filters small,small+large --rr-targets 1.0,1.5,2.0,3.0
 
-## Comandi CLI consigliati
-Focus v1.4 su SP500:
-```bash
-python main.py --period 60d --interval 5m --markets SP500 --force-close-options none --breakout-windows 10:00,10:30 --orb-range-filters small,small+large
-```
+Confronto esteso su piu filtri ORB:
+python main.py --period 60d --interval 5m --markets SP500 --force-close-options none --breakout-windows 10:30 --orb-range-filters all,small,medium,large,small+medium,medium+large,small+large --rr-targets 1.0,1.5,2.0,3.0
 
-Confronto esteso filtri ORB:
-```bash
-python main.py --period 60d --interval 5m --markets SP500 --force-close-options none --breakout-windows 10:00,10:30 --orb-range-filters all,small,medium,large,small+medium,medium+large,small+large
-```
-
-Confronto multi-market mantenendo analisi v1.4:
-```bash
-python main.py --period 60d --interval 5m --markets SP500,NASDAQ --force-close-options none --breakout-windows 10:00,10:30 --orb-range-filters small,small+large
-```
+Confronto multi-market mantenendo RR multipli:
+python main.py --period 60d --interval 5m --markets SP500,NASDAQ --force-close-options none --breakout-windows 10:30 --orb-range-filters small,small+large --rr-targets 1.0,1.5,2.0

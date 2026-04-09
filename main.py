@@ -1,10 +1,10 @@
 """
-CLI principale per backtest ORB v1.4.
+CLI principale per backtest ORB v1.5.
 
 Esempi:
     python main.py
     python main.py --period 60d --interval 5m --markets SP500
-    python main.py --force-close-options none --breakout-windows 10:00,10:30 --orb-range-filters small,small+large
+    python main.py --force-close-options none --breakout-windows 10:30 --orb-range-filters small,small+large --rr-targets 1.0,1.5,2.0,3.0
 """
 
 from __future__ import annotations
@@ -27,6 +27,7 @@ from config import (
     DEFAULT_FORCE_CLOSE_OPTIONS,
     DEFAULT_MARKETS,
     DEFAULT_ORB_RANGE_FILTERS,
+    DEFAULT_RR_TARGETS,
     MARKET_LABELS,
     build_market_scenarios,
     parse_breakout_windows,
@@ -34,6 +35,7 @@ from config import (
     parse_markets,
     parse_orb_range_filters,
     parse_orb_range_quantiles,
+    parse_rr_targets,
 )
 from reporting import save_scenario_outputs, split_primary_secondary, summarize_outputs
 
@@ -65,7 +67,7 @@ def fetch_data(symbol: str, period: str, interval: str) -> pd.DataFrame:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Backtest ORB v1.4")
+    parser = argparse.ArgumentParser(description="Backtest ORB v1.5")
     parser.add_argument("--period", default="120d", help="Periodo storico (default: 120d)")
     parser.add_argument("--interval", default="5m", help="Timeframe dati (default: 5m)")
     parser.add_argument(
@@ -96,6 +98,11 @@ def main() -> None:
         default="0.33,0.66",
         help="Quantili classe ORB range (small/medium/large), esempio: 0.33,0.66",
     )
+    parser.add_argument(
+        "--rr-targets",
+        default=DEFAULT_RR_TARGETS,
+        help="Multipli RR separati da virgola, esempio: 1.0,1.5,2.0,3.0",
+    )
     parser.add_argument("--max-trades-per-day", type=int, default=2, help="Max trade giornalieri (default: 2)")
     parser.add_argument("--capital", type=float, default=10000.0, help="Capitale iniziale equity model")
     parser.add_argument(
@@ -121,6 +128,7 @@ def main() -> None:
         breakout_windows = parse_breakout_windows(args.breakout_windows)
         orb_range_filters = parse_orb_range_filters(args.orb_range_filters)
         orb_range_quantiles = parse_orb_range_quantiles(args.orb_range_quantiles)
+        rr_targets = parse_rr_targets(args.rr_targets)
     except ValueError as exc:
         print(f"Errore parametri: {exc}")
         sys.exit(1)
@@ -135,6 +143,7 @@ def main() -> None:
             force_close_options=force_close_options,
             breakout_windows=breakout_windows,
             orb_range_filters=orb_range_filters,
+            rr_targets=rr_targets,
         )
 
         if not market_scenarios:
@@ -178,7 +187,7 @@ def main() -> None:
     primary, secondary = split_primary_secondary(table)
 
     if not primary.empty:
-        print("\nScenari focus v1.4 (SP500, no_time_close, 10:00/10:30, small|small+large):")
+        print("\nScenari focus v1.5 (SP500, no_time_close, 10:30, small|small+large, RR multipli):")
         print(primary.to_string(index=False))
 
     if not secondary.empty:

@@ -1,5 +1,5 @@
 """
-Backtesting helpers per Opening Range Breakout (ORB) v1.4.
+Backtesting helpers per Opening Range Breakout (ORB) v1.5.
 """
 
 from __future__ import annotations
@@ -20,6 +20,7 @@ class MarketBacktestResult:
     force_close_label: str
     breakout_window_label: str
     orb_range_filter_label: str
+    rr_target: float
     trades: pd.DataFrame
     metrics: dict
     equity_curve: pd.DataFrame
@@ -479,6 +480,7 @@ def run_market_backtest(
         market=scenario.market_label,
         signal_end=scenario.breakout_window_end,
         breakout_window_label=scenario.breakout_window_label,
+        rr_target=scenario.rr_target,
         force_close_time=scenario.force_close_time,
         max_trades_per_day=max_trades_per_day,
     )
@@ -518,6 +520,7 @@ def run_market_backtest(
     metrics["force_close"] = scenario.force_close_label
     metrics["breakout_window"] = scenario.breakout_window_label
     metrics["orb_range_filter"] = scenario.orb_range_filter_label
+    metrics["rr_target"] = float(scenario.rr_target)
     metrics["orb_range_class_thresholds"] = {
         "lower": range_thresholds.lower,
         "upper": range_thresholds.upper,
@@ -539,6 +542,7 @@ def run_market_backtest(
         force_close_label=scenario.force_close_label,
         breakout_window_label=scenario.breakout_window_label,
         orb_range_filter_label=scenario.orb_range_filter_label,
+        rr_target=float(scenario.rr_target),
         trades=trades,
         metrics=metrics,
         equity_curve=equity_curve,
@@ -559,7 +563,7 @@ def format_market_report(result: MarketBacktestResult) -> str:
         f"Trades: {m['total_trades']} (LONG: {m['long_trades']} / SHORT: {m['short_trades']})",
         (
             f"Window: {result.breakout_window_label} | Force close: {result.force_close_label} | "
-            f"ORB filter: {result.orb_range_filter_label}"
+            f"ORB filter: {result.orb_range_filter_label} | RR target: {result.rr_target:.2f}"
         ),
         f"Win rate: {m['win_rate']:.2f}% | Profit factor: {m['profit_factor']:.4f}",
         f"Average R: {m['average_r']:+.4f} | Total R: {m['total_r']:+.4f}",
@@ -594,6 +598,7 @@ def performance_per_market(results: list[MarketBacktestResult]) -> pd.DataFrame:
         "breakout_window",
         "force_close",
         "orb_range_filter",
+        "rr_target",
         "total_trades",
         "long_trades",
         "short_trades",
@@ -621,6 +626,7 @@ def performance_per_market(results: list[MarketBacktestResult]) -> pd.DataFrame:
                 "breakout_window": result.breakout_window_label,
                 "force_close": result.force_close_label,
                 "orb_range_filter": result.orb_range_filter_label,
+                "rr_target": result.rr_target,
                 "total_trades": metrics["total_trades"],
                 "long_trades": metrics["long_trades"],
                 "short_trades": metrics["short_trades"],
@@ -639,6 +645,6 @@ def performance_per_market(results: list[MarketBacktestResult]) -> pd.DataFrame:
 
     return (
         pd.DataFrame(rows)
-        .sort_values(["market", "breakout_window", "force_close", "orb_range_filter"])
+        .sort_values(["market", "breakout_window", "force_close", "orb_range_filter", "rr_target"])
         .reset_index(drop=True)
     )
