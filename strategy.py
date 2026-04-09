@@ -34,6 +34,7 @@ TRADE_COLUMNS = [
     "orb_range_class",
     "breakout_candle_time",
     "breakout_time_ny",
+    "breakout_minute_bucket",
     "minutes_from_0945_to_breakout",
     "entry_time",
     "entry_time_ny",
@@ -81,6 +82,7 @@ class TradeRecord:
     orb_range_class: str
     breakout_candle_time: pd.Timestamp
     breakout_time_ny: str
+    breakout_minute_bucket: str
     minutes_from_0945_to_breakout: float
     entry_time: pd.Timestamp
     entry_time_ny: str
@@ -353,6 +355,7 @@ class OpeningRangeBreakoutStrategy:
             orb_range_class="unclassified",
             breakout_candle_time=trade["breakout_candle_time"],
             breakout_time_ny=trade["breakout_candle_time"].strftime("%Y-%m-%d %H:%M:%S %Z"),
+            breakout_minute_bucket=trade["breakout_candle_time"].strftime("%H:%M"),
             minutes_from_0945_to_breakout=minutes_from_0945,
             entry_time=trade["entry_time"],
             entry_time_ny=trade["entry_time"].strftime("%Y-%m-%d %H:%M:%S %Z"),

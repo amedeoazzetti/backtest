@@ -18,7 +18,13 @@ MARKET_LABELS = {
 DEFAULT_MARKETS = "SP500"
 DEFAULT_FORCE_CLOSE_OPTIONS = "none"
 DEFAULT_BREAKOUT_WINDOWS = "10:00,10:30"
-DEFAULT_ORB_RANGE_FILTERS = "all"
+DEFAULT_ORB_RANGE_FILTERS = "small,small+large"
+
+PRIMARY_FOCUS_BREAKOUT_WINDOWS = {
+    "breakout_window_0945_1000",
+    "breakout_window_0945_1030",
+}
+PRIMARY_FOCUS_ORB_FILTERS = {"small", "small+large"}
 
 VALID_ORB_RANGE_CLASSES = {"small", "medium", "large"}
 

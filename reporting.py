@@ -6,10 +6,10 @@ from pathlib import Path
 import pandas as pd
 
 from backtest import MarketBacktestResult
-from config import market_slug
+from config import PRIMARY_FOCUS_BREAKOUT_WINDOWS, PRIMARY_FOCUS_ORB_FILTERS, market_slug
 
 
-PRIMARY_FORCE_CLOSE_LABELS = {"no_time_close", "time_close_1200"}
+PRIMARY_FORCE_CLOSE_LABELS = {"no_time_close"}
 
 
 def _json_default_serializer(value):
@@ -37,12 +37,16 @@ def save_scenario_outputs(result: MarketBacktestResult, output_dir: Path) -> dic
         "metrics": output_dir / f"metrics_{m_slug}_{s_slug}.json",
         "equity": output_dir / f"equity_{m_slug}_{s_slug}.csv",
         "breakout_time_stats": output_dir / f"breakout_time_stats_{m_slug}_{s_slug}.csv",
+        "breakout_minute_stats": output_dir / f"breakout_minute_stats_{m_slug}_{s_slug}.csv",
+        "direction_stats": output_dir / f"direction_stats_{m_slug}_{s_slug}.csv",
         "orb_range_stats": output_dir / f"orb_range_stats_{m_slug}_{s_slug}.csv",
     }
 
     _prepare_trade_export(result.trades).to_csv(paths["trades"], index=False)
     result.equity_curve.to_csv(paths["equity"], index=False)
     result.breakout_time_stats.to_csv(paths["breakout_time_stats"], index=False)
+    result.breakout_minute_stats.to_csv(paths["breakout_minute_stats"], index=False)
+    result.direction_stats.to_csv(paths["direction_stats"], index=False)
     result.orb_range_stats.to_csv(paths["orb_range_stats"], index=False)
 
     with paths["metrics"].open("w", encoding="utf-8") as fp:
@@ -57,6 +61,8 @@ def summarize_outputs(paths: dict[str, Path]) -> str:
         "metrics",
         "equity",
         "breakout_time_stats",
+        "breakout_minute_stats",
+        "direction_stats",
         "orb_range_stats",
     ]
     lines = ["File salvati:"]
@@ -70,6 +76,14 @@ def split_primary_secondary(table: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataF
     if table.empty or "force_close" not in table.columns:
         return table.copy(), pd.DataFrame(columns=table.columns)
 
-    primary = table[table["force_close"].isin(PRIMARY_FORCE_CLOSE_LABELS)].copy()
-    secondary = table[~table["force_close"].isin(PRIMARY_FORCE_CLOSE_LABELS)].copy()
+    primary_mask = table["force_close"].isin(PRIMARY_FORCE_CLOSE_LABELS)
+
+    if "breakout_window" in table.columns:
+        primary_mask &= table["breakout_window"].isin(PRIMARY_FOCUS_BREAKOUT_WINDOWS)
+
+    if "orb_range_filter" in table.columns:
+        primary_mask &= table["orb_range_filter"].isin(PRIMARY_FOCUS_ORB_FILTERS)
+
+    primary = table[primary_mask].copy()
+    secondary = table[~primary_mask].copy()
     return primary.reset_index(drop=True), secondary.reset_index(drop=True)

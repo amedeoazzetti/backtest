@@ -1,10 +1,10 @@
 """
-CLI principale per backtest ORB v1.3.
+CLI principale per backtest ORB v1.4.
 
 Esempi:
     python main.py
     python main.py --period 60d --interval 5m --markets SP500
-    python main.py --force-close-options none --breakout-windows 10:00,10:30 --orb-range-filters all,small,medium,large,small+medium
+    python main.py --force-close-options none --breakout-windows 10:00,10:30 --orb-range-filters small,small+large
 """
 
 from __future__ import annotations
@@ -65,7 +65,7 @@ def fetch_data(symbol: str, period: str, interval: str) -> pd.DataFrame:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Backtest ORB v1.3")
+    parser = argparse.ArgumentParser(description="Backtest ORB v1.4")
     parser.add_argument("--period", default="120d", help="Periodo storico (default: 120d)")
     parser.add_argument("--interval", default="5m", help="Timeframe dati (default: 5m)")
     parser.add_argument(
@@ -178,11 +178,11 @@ def main() -> None:
     primary, secondary = split_primary_secondary(table)
 
     if not primary.empty:
-        print("\nScenari principali v1.3 (no_time_close + time_close_1200):")
+        print("\nScenari focus v1.4 (SP500, no_time_close, 10:00/10:30, small|small+large):")
         print(primary.to_string(index=False))
 
     if not secondary.empty:
-        print("\nScenari secondari (declassati):")
+        print("\nAltri scenari eseguiti:")
         print(secondary.to_string(index=False))
 
 
