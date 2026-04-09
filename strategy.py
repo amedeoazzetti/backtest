@@ -6,8 +6,9 @@ Regole implementate:
 - ORB M15: 09:30-09:45
 - Segnali M5 validi: 09:45-11:00
 - Entry su open candela successiva alla breakout candle
-- Stop sul lato opposto del range e TP fisso 1:1
+- Stop sul lato opposto del range e TP configurabile via RR target
 - Max 2 trade al giorno
+- Modalita' direzione: both / long_only / short_only
 """
 
 from __future__ import annotations
@@ -26,6 +27,7 @@ TRADE_COLUMNS = [
     "market",
     "direction",
     "rr_target",
+    "trade_direction_mode",
     "breakout_window_label",
     "orb_high",
     "orb_low",
@@ -66,6 +68,7 @@ class ORBConfig:
     signal_end: time = time(11, 0)
     breakout_window_label: Optional[str] = None
     rr_target: float = 1.0
+    trade_direction_mode: str = "both"
     max_trades_per_day: int = 2
     force_close_time: Optional[time] = None
 
@@ -76,6 +79,7 @@ class TradeRecord:
     market: str
     direction: str
     rr_target: float
+    trade_direction_mode: str
     breakout_window_label: str
     orb_high: float
     orb_low: float
@@ -129,11 +133,28 @@ def compute_take_profit(
     raise ValueError(f"Direzione non valida per TP: {direction}")
 
 
+def is_direction_allowed(direction: str, trade_direction_mode: str) -> bool:
+    """Verifica se la direzione del segnale e' consentita dalla modalita' attiva."""
+    mode = trade_direction_mode.lower()
+    if mode == "both":
+        return direction in {"LONG", "SHORT"}
+    if mode == "long_only":
+        return direction == "LONG"
+    if mode == "short_only":
+        return direction == "SHORT"
+    raise ValueError(f"trade_direction_mode non valido: {trade_direction_mode}")
+
+
 class OpeningRangeBreakoutStrategy:
     def __init__(self, config: ORBConfig):
         self.config = config
         if not math.isfinite(config.rr_target) or config.rr_target <= 0:
             raise ValueError("rr_target deve essere un numero finito > 0")
+
+        if config.trade_direction_mode not in {"both", "long_only", "short_only"}:
+            raise ValueError(
+                "trade_direction_mode non valido. Usa: both, long_only, short_only"
+            )
 
         self.ny_tz = ZoneInfo(config.timezone)
         self.breakout_window_label = config.breakout_window_label or (
@@ -292,6 +313,7 @@ class OpeningRangeBreakoutStrategy:
             ),
             "breakout_window_label": self.breakout_window_label,
             "rr_target": float(self.config.rr_target),
+            "trade_direction_mode": self.config.trade_direction_mode,
         }
         self.trade_count += 1
         self.direction_taken = "LONG"
@@ -348,6 +370,7 @@ class OpeningRangeBreakoutStrategy:
             ),
             "breakout_window_label": self.breakout_window_label,
             "rr_target": float(self.config.rr_target),
+            "trade_direction_mode": self.config.trade_direction_mode,
         }
         self.trade_count += 1
         self.direction_taken = "SHORT"
@@ -386,6 +409,7 @@ class OpeningRangeBreakoutStrategy:
             market=self.config.market,
             direction=direction,
             rr_target=float(trade["rr_target"]),
+            trade_direction_mode=str(trade["trade_direction_mode"]),
             breakout_window_label=str(trade["breakout_window_label"]),
             orb_high=float(trade["orb_high"]),
             orb_low=float(trade["orb_low"]),
@@ -543,7 +567,9 @@ class OpeningRangeBreakoutStrategy:
                 self.ambiguous_signal_candles += 1
                 continue
 
-            if self.check_long_signal(candle):
+            if self.check_long_signal(candle) and is_direction_allowed(
+                "LONG", self.config.trade_direction_mode
+            ):
                 self.create_long_trade(
                     next_candle_time=next_candle_time,
                     next_candle_open=float(next_candle["open"]),
@@ -551,7 +577,9 @@ class OpeningRangeBreakoutStrategy:
                 )
                 continue
 
-            if self.check_short_signal(candle):
+            if self.check_short_signal(candle) and is_direction_allowed(
+                "SHORT", self.config.trade_direction_mode
+            ):
                 self.create_short_trade(
                     next_candle_time=next_candle_time,
                     next_candle_open=float(next_candle["open"]),

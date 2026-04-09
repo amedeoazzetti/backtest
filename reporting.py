@@ -6,7 +6,13 @@ from pathlib import Path
 import pandas as pd
 
 from backtest import MarketBacktestResult
-from config import PRIMARY_FOCUS_BREAKOUT_WINDOWS, PRIMARY_FOCUS_ORB_FILTERS, market_slug
+from config import (
+    PRIMARY_FOCUS_BREAKOUT_WINDOWS,
+    PRIMARY_FOCUS_ORB_FILTERS,
+    PRIMARY_FOCUS_RR_TARGETS,
+    PRIMARY_FOCUS_TRADE_DIRECTION_MODES,
+    market_slug,
+)
 
 
 PRIMARY_FORCE_CLOSE_LABELS = {"no_time_close"}
@@ -83,6 +89,12 @@ def split_primary_secondary(table: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataF
 
     if "orb_range_filter" in table.columns:
         primary_mask &= table["orb_range_filter"].isin(PRIMARY_FOCUS_ORB_FILTERS)
+
+    if "rr_target" in table.columns:
+        primary_mask &= table["rr_target"].isin(PRIMARY_FOCUS_RR_TARGETS)
+
+    if "trade_direction_mode" in table.columns:
+        primary_mask &= table["trade_direction_mode"].isin(PRIMARY_FOCUS_TRADE_DIRECTION_MODES)
 
     primary = table[primary_mask].copy()
     secondary = table[~primary_mask].copy()

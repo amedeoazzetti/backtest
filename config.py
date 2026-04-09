@@ -20,14 +20,18 @@ DEFAULT_MARKETS = "SP500"
 DEFAULT_FORCE_CLOSE_OPTIONS = "none"
 DEFAULT_BREAKOUT_WINDOWS = "10:30"
 DEFAULT_ORB_RANGE_FILTERS = "small,small+large"
-DEFAULT_RR_TARGETS = "1.0,1.5,2.0,3.0"
+DEFAULT_RR_TARGETS = "1.0,1.5"
+DEFAULT_TRADE_DIRECTION_MODES = "both,long_only,short_only"
 
 PRIMARY_FOCUS_BREAKOUT_WINDOWS = {
     "breakout_window_0945_1030",
 }
 PRIMARY_FOCUS_ORB_FILTERS = {"small", "small+large"}
+PRIMARY_FOCUS_RR_TARGETS = {1.0, 1.5}
+PRIMARY_FOCUS_TRADE_DIRECTION_MODES = {"both", "long_only", "short_only"}
 
 VALID_ORB_RANGE_CLASSES = {"small", "medium", "large"}
+VALID_TRADE_DIRECTION_MODES = {"both", "long_only", "short_only"}
 
 
 @dataclass(frozen=True)
@@ -59,6 +63,7 @@ class ScenarioConfig:
     breakout_window_end: time
     orb_range_filter: ORBRangeFilterConfig
     rr_target: float
+    trade_direction_mode: str
 
     @property
     def force_close_label(self) -> str:
@@ -85,10 +90,14 @@ class ScenarioConfig:
         return rr_target_label(self.rr_target)
 
     @property
+    def trade_direction_mode_label(self) -> str:
+        return self.trade_direction_mode
+
+    @property
     def scenario_label(self) -> str:
         return (
             f"{self.breakout_window_label}_{self.force_close_label}_"
-            f"orb_{self.orb_range_filter_slug}_{self.rr_target_label}"
+            f"orb_{self.orb_range_filter_slug}_{self.rr_target_label}_{self.trade_direction_mode_label}"
         )
 
 
@@ -135,6 +144,33 @@ def parse_rr_targets(raw_targets: str) -> list[float]:
         if item not in seen:
             unique.append(item)
             seen.add(item)
+    return unique
+
+
+def parse_trade_direction_modes(raw_modes: str) -> list[str]:
+    modes: list[str] = []
+    for token in raw_modes.split(","):
+        mode = token.strip().lower()
+        if not mode:
+            continue
+
+        if mode not in VALID_TRADE_DIRECTION_MODES:
+            raise ValueError(
+                f"Trade direction mode non valido: {token}. "
+                "Valori supportati: both, long_only, short_only"
+            )
+
+        modes.append(mode)
+
+    if not modes:
+        raise ValueError("Nessun trade direction mode valido specificato.")
+
+    unique = []
+    seen = set()
+    for mode in modes:
+        if mode not in seen:
+            unique.append(mode)
+            seen.add(mode)
     return unique
 
 
@@ -314,6 +350,7 @@ def build_market_scenarios(
     breakout_windows: list[time],
     orb_range_filters: list[ORBRangeFilterConfig],
     rr_targets: list[float],
+    trade_direction_modes: list[str],
 ) -> list[ScenarioConfig]:
     market_label = MARKET_LABELS[market_code]
     symbol = MARKET_SYMBOLS[market_code]
@@ -323,16 +360,18 @@ def build_market_scenarios(
         for force_close_time in force_close_options:
             for orb_range_filter in orb_range_filters:
                 for rr_target in rr_targets:
-                    scenarios.append(
-                        ScenarioConfig(
-                            market_code=market_code,
-                            market_label=market_label,
-                            symbol=symbol,
-                            force_close_time=force_close_time,
-                            breakout_window_end=breakout_window_end,
-                            orb_range_filter=orb_range_filter,
-                            rr_target=rr_target,
+                    for trade_direction_mode in trade_direction_modes:
+                        scenarios.append(
+                            ScenarioConfig(
+                                market_code=market_code,
+                                market_label=market_label,
+                                symbol=symbol,
+                                force_close_time=force_close_time,
+                                breakout_window_end=breakout_window_end,
+                                orb_range_filter=orb_range_filter,
+                                rr_target=rr_target,
+                                trade_direction_mode=trade_direction_mode,
+                            )
                         )
-                    )
 
     return scenarios
