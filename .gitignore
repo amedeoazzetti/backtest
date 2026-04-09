@@ -1,0 +1,20 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environment
+.venv/
+venv/
+
+# Local tooling
+.claude/
+
+# Backtest outputs
+outputs/
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.vscode/
