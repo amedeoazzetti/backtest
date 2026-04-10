@@ -471,6 +471,7 @@ def _compute_metrics(
 
 def run_market_backtest(
     df: pd.DataFrame,
+    df_15m: pd.DataFrame | None,
     scenario: ScenarioConfig,
     max_trades_per_day: int,
     initial_capital: float,
@@ -488,7 +489,7 @@ def run_market_backtest(
     )
 
     strategy = OpeningRangeBreakoutStrategy(config=strategy_config)
-    trades, diagnostics = strategy.run(df)
+    trades, diagnostics = strategy.run(df, df_15m=df_15m)
 
     trades = _ensure_datetime_columns(trades)
     if not trades.empty and "breakout_minute_bucket" not in trades.columns:
@@ -584,6 +585,7 @@ def format_market_report(result: MarketBacktestResult) -> str:
             f"invalid_risk_entries: {result.diagnostics.get('invalid_risk_entries', 0)}, "
             f"days_missing_orb: {result.diagnostics.get('days_missing_orb', 0)}, "
             f"rows_dropped_nan: {result.diagnostics.get('rows_dropped_nan', 0)}, "
+            f"incomplete_orb_bars: {result.diagnostics.get('incomplete_orb_bars', 0)}, "
             f"filtered_out_by_orb_filter: {result.diagnostics.get('filtered_out_trades_by_orb_filter', 0)}"
         ),
     ]

@@ -168,6 +168,7 @@ class OpeningRangeBreakoutStrategy:
         self.invalid_risk_entries = 0
         self.days_missing_orb = 0
         self.rows_dropped_nan = 0
+        self.incomplete_orb_bars = 0
 
     def reset_day(self) -> None:
         self.orb_high: Optional[float] = None
@@ -210,13 +211,46 @@ class OpeningRangeBreakoutStrategy:
         working = working[working["high"] >= working["low"]]
         return working
 
-    def set_opening_range(self, day_frame: pd.DataFrame) -> bool:
-        # ORB M15 ricavata dai dati M5 tramite resample a 15 minuti.
-        m15 = (
-            day_frame.resample("15min", label="left", closed="left")
-            .agg({"open": "first", "high": "max", "low": "min", "close": "last"})
-            .dropna(subset=["open", "high", "low", "close"])
-        )
+    def prepare_m15_dataframe(self, df: pd.DataFrame) -> pd.DataFrame:
+        if not isinstance(df.index, pd.DatetimeIndex):
+            raise ValueError("Il DataFrame 15m deve avere un DatetimeIndex.")
+
+        working = df.copy()
+        working.columns = [str(c).lower() for c in working.columns]
+        required = {"open", "high", "low", "close"}
+        missing = required.difference(working.columns)
+        if missing:
+            missing_cols = ", ".join(sorted(missing))
+            raise ValueError(f"Colonne OHLC mancanti nel DataFrame 15m: {missing_cols}")
+
+        working = working.sort_index()
+        working = working[~working.index.duplicated(keep="last")]
+
+        if working.index.tz is None:
+            working.index = working.index.tz_localize("UTC")
+
+        working.index = working.index.tz_convert(self.ny_tz)
+
+        rows_before = len(working)
+        working = working.dropna(subset=["open", "high", "low", "close"])
+        self.rows_dropped_nan += rows_before - len(working)
+        working = working[working["high"] >= working["low"]]
+        return working
+
+    def set_opening_range(
+        self,
+        day_frame_5m: pd.DataFrame,
+        day_frame_15m: Optional[pd.DataFrame] = None,
+    ) -> bool:
+        # ORB M15 derivata da dataset 15m dedicato, fallback su resample da 5m.
+        if day_frame_15m is not None:
+            m15 = day_frame_15m
+        else:
+            m15 = (
+                day_frame_5m.resample("15min", label="left", closed="left")
+                .agg({"open": "first", "high": "max", "low": "min", "close": "last"})
+                .dropna(subset=["open", "high", "low", "close"])
+            )
 
         orb_rows = m15[m15.index.time == self.config.orb_start]
         if orb_rows.empty:
@@ -224,6 +258,12 @@ class OpeningRangeBreakoutStrategy:
             return False
 
         orb_candle = orb_rows.iloc[0]
+        source_5m_count = orb_candle.get("source_5m_count", None)
+        if source_5m_count is not None and float(source_5m_count) < 3:
+            self.incomplete_orb_bars += 1
+            self.session_active = False
+            return False
+
         self.orb_high = float(orb_candle["high"])
         self.orb_low = float(orb_candle["low"])
         self.orb_range = self.orb_high - self.orb_low
@@ -500,18 +540,31 @@ class OpeningRangeBreakoutStrategy:
 
         return None
 
-    def run(self, df: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, Any]]:
+    def run(
+        self,
+        df: pd.DataFrame,
+        df_15m: Optional[pd.DataFrame] = None,
+    ) -> tuple[pd.DataFrame, dict[str, Any]]:
         data = self.prepare_dataframe(df)
+        m15_data = self.prepare_m15_dataframe(df_15m) if df_15m is not None else None
         if data.empty:
             empty = pd.DataFrame(columns=TRADE_COLUMNS)
             diagnostics = {
                 "ambiguous_signal_candles": 0,
                 "invalid_risk_entries": 0,
+                "days_missing_orb": 0,
+                "rows_dropped_nan": 0,
+                "incomplete_orb_bars": 0,
                 "days_processed": 0,
             }
             return empty, diagnostics
 
         day_groups = {day: frame for day, frame in data.groupby(data.index.date)}
+        day_groups_m15 = (
+            {day: frame for day, frame in m15_data.groupby(m15_data.index.date)}
+            if m15_data is not None
+            else {}
+        )
         trades: list[TradeRecord] = []
 
         for i in range(len(data)):
@@ -524,7 +577,8 @@ class OpeningRangeBreakoutStrategy:
                 self.current_day = session_day
                 day_frame = day_groups.get(session_day)
                 if day_frame is not None:
-                    has_orb = self.set_opening_range(day_frame)
+                    day_frame_m15 = day_groups_m15.get(session_day)
+                    has_orb = self.set_opening_range(day_frame, day_frame_m15)
                     if not has_orb:
                         self.days_missing_orb += 1
 
@@ -602,6 +656,7 @@ class OpeningRangeBreakoutStrategy:
             "invalid_risk_entries": int(self.invalid_risk_entries),
             "days_missing_orb": int(self.days_missing_orb),
             "rows_dropped_nan": int(self.rows_dropped_nan),
+            "incomplete_orb_bars": int(self.incomplete_orb_bars),
             "days_processed": len(day_groups),
         }
         return trades_df, diagnostics

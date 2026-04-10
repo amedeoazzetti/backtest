@@ -5,6 +5,7 @@ Esempi:
     python main.py
     python main.py --period 60d --interval 5m --markets SP500
     python main.py --force-close-options none --breakout-windows 10:30 --orb-range-filters small,small+large --rr-targets 1.0,1.5 --trade-direction-modes both,long_only,short_only
+    python main.py --csv-path data/ES_5Years_8_11_2024.csv --csv-timezone UTC --markets SP500
 """
 
 from __future__ import annotations
@@ -12,6 +13,7 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
 
@@ -39,10 +41,11 @@ from config import (
     parse_rr_targets,
     parse_trade_direction_modes,
 )
+from data_utils import load_csv_market_data, prepare_external_market_data
 from reporting import save_scenario_outputs, split_primary_secondary, summarize_outputs
 
 
-def fetch_data(symbol: str, period: str, interval: str) -> pd.DataFrame:
+def fetch_provider_data(symbol: str, period: str, interval: str) -> pd.DataFrame:
     print(f"Scarico {symbol} | period={period} | interval={interval}")
     df = yf.download(
         tickers=symbol,
@@ -59,17 +62,59 @@ def fetch_data(symbol: str, period: str, interval: str) -> pd.DataFrame:
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
 
-    df.columns = [str(c).lower() for c in df.columns]
-    required = ["open", "high", "low", "close"]
-    missing = [c for c in required if c not in df.columns]
-    if missing:
-        raise ValueError(f"Colonne mancanti per {symbol}: {', '.join(missing)}")
-
     return df
+
+
+def _print_data_diagnostics(market_label: str, diagnostics: dict[str, Any]) -> None:
+    print(f"\nData diagnostics [{market_label}] ({diagnostics.get('data_source', 'unknown')}):")
+
+    rows_read = diagnostics.get("csv_rows_read", diagnostics.get("provider_rows_read", 0))
+    print(
+        "  rows: "
+        f"letto={rows_read}, "
+        f"pulito_5m={diagnostics.get('rows_after_cleaning', 0)}, "
+        f"m15_pronto={diagnostics.get('m15_ready_bars', 0)}"
+    )
+    print(
+        "  timezone: "
+        f"sorgente={diagnostics.get('source_timezone', 'n/a')} -> "
+        f"finale={diagnostics.get('target_timezone', 'n/a')}"
+    )
+    print(
+        "  pulizia_5m: "
+        f"bad_datetime={diagnostics.get('dropped_bad_datetime_rows', 0)}, "
+        f"bad_ohlc={diagnostics.get('dropped_bad_ohlc_rows', 0)}, "
+        f"high_lt_low={diagnostics.get('dropped_bad_high_low_rows', 0)}, "
+        f"duplicati={diagnostics.get('dropped_duplicate_rows', 0)}"
+    )
+    print(
+        "  blocchi_15m: "
+        f"totali={diagnostics.get('m15_total_bars', 0)}, "
+        f"incompleti={diagnostics.get('m15_incomplete_bars', 0)}, "
+        f"policy={diagnostics.get('m15_incomplete_policy', 'n/a')}, "
+        f"scartati={diagnostics.get('m15_dropped_incomplete_bars', 0)}"
+    )
+    print(
+        "  orb_0930: "
+        f"presenti={diagnostics.get('m15_orb_0930_bars', 0)}, "
+        f"incomplete={diagnostics.get('m15_orb_0930_incomplete_bars', 0)}"
+    )
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Backtest ORB v1.6")
+    parser.add_argument("--csv-path", default=None, help="Percorso CSV 5m sorgente primaria")
+    parser.add_argument(
+        "--csv-timezone",
+        default="UTC",
+        help="Timezone dei timestamp CSV (es: UTC, America/New_York)",
+    )
+    parser.add_argument(
+        "--m15-incomplete-policy",
+        choices=["drop", "keep"],
+        default="drop",
+        help="Gestione blocchi 15m incompleti derivati dal 5m (default: drop)",
+    )
     parser.add_argument("--period", default="120d", help="Periodo storico (default: 120d)")
     parser.add_argument("--interval", default="5m", help="Timeframe dati (default: 5m)")
     parser.add_argument(
@@ -141,8 +186,27 @@ def main() -> None:
         print(f"Errore parametri: {exc}")
         sys.exit(1)
 
+    if args.csv_path and len(markets) != 1:
+        print("Errore parametri: in modalita CSV specifica un solo mercato per run.")
+        sys.exit(1)
+
     output_dir = Path(args.output_dir)
     all_results = []
+    drop_incomplete_15m_blocks = args.m15_incomplete_policy == "drop"
+
+    csv_data_5m = None
+    csv_data_15m = None
+    csv_diagnostics = None
+    if args.csv_path:
+        try:
+            csv_data_5m, csv_data_15m, csv_diagnostics = load_csv_market_data(
+                csv_path=args.csv_path,
+                csv_timezone=args.csv_timezone,
+                drop_incomplete_15m_blocks=drop_incomplete_15m_blocks,
+            )
+        except Exception as exc:
+            print(f"Errore CSV: {exc}")
+            sys.exit(1)
 
     for market_code in markets:
         market_label = MARKET_LABELS[market_code]
@@ -165,14 +229,29 @@ def main() -> None:
         print("#" * 100)
 
         try:
-            market_df = fetch_data(symbol=symbol, period=args.period, interval=args.interval)
+            if csv_data_5m is not None and csv_data_15m is not None and csv_diagnostics is not None:
+                market_df_5m = csv_data_5m
+                market_df_15m = csv_data_15m
+                data_diagnostics = csv_diagnostics
+                print(f"Uso sorgente CSV: {args.csv_path}")
+            else:
+                provider_raw = fetch_provider_data(symbol=symbol, period=args.period, interval=args.interval)
+                market_df_5m, market_df_15m, data_diagnostics = prepare_external_market_data(
+                    raw_df=provider_raw,
+                    source_timezone_fallback="UTC",
+                    drop_incomplete_15m_blocks=drop_incomplete_15m_blocks,
+                )
         except Exception as exc:
-            print(f"Errore download {market_label}: {exc}")
+            source_label = "CSV" if args.csv_path else "download"
+            print(f"Errore {source_label} {market_label}: {exc}")
             continue
+
+        _print_data_diagnostics(market_label, data_diagnostics)
 
         for scenario in market_scenarios:
             result = run_market_backtest(
-                df=market_df,
+                df=market_df_5m,
+                df_15m=market_df_15m,
                 scenario=scenario,
                 max_trades_per_day=args.max_trades_per_day,
                 initial_capital=args.capital,

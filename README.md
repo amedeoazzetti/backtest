@@ -22,6 +22,56 @@ Focus operativo principale:
 - Stop loss sul lato opposto del range
 - Take profit con RR target configurabile
 
+## Nuova Sorgente Dati CSV 5m
+Il backtester supporta una modalita sorgente primaria da CSV storico.
+
+Nuovi parametri CLI:
+- --csv-path data/ES_5Years_8_11_2024.csv
+- --csv-timezone UTC
+- --m15-incomplete-policy drop|keep
+
+Comportamento:
+- se --csv-path e presente, i dati vengono letti dal CSV invece del provider esterno
+- i timestamp sono interpretati usando --csv-timezone
+- i dati vengono poi convertiti internamente in America/New_York
+
+CSV atteso (colonne):
+- Time, Open, High, Low, Close, Volume
+
+Pipeline dati:
+- parsing robusto datetime
+- sort cronologico
+- rimozione duplicati
+- conversione numerica OHLCV
+- scarto righe malformate/NaN
+- controllo high >= low
+
+Diagnostica in log:
+- righe lette dal CSV
+- righe dopo pulizia
+- timezone sorgente/finale
+- candele 15m create
+- blocchi 15m incompleti e policy applicata
+
+## Resampling 15m Da 5m
+Il 15m viene derivato dal 5m con regole OHLCV standard:
+- Open: prima open del blocco
+- High: max high del blocco
+- Low: min low del blocco
+- Close: ultima close del blocco
+- Volume: somma volumi del blocco
+
+Allineamento:
+- resample a 15 minuti con ancoraggio ai quarti d'ora reali
+- in timezone America/New_York
+- quindi la candela ORB 09:30-09:45 e allineata correttamente
+
+Qualita blocchi 15m:
+- ogni candela 15m tiene il conteggio delle candele 5m sorgenti
+- blocco completo ideale: 3 candele 5m
+- con --m15-incomplete-policy drop (default) i blocchi incompleti vengono scartati
+- con --m15-incomplete-policy keep vengono mantenuti e segnalati nei log
+
 ## RR Target
 Parametro CLI:
 - --rr-targets 1.0,1.5
@@ -112,6 +162,12 @@ Gestione edge cases:
 - output vuoti ma coerenti
 
 ## Comandi CLI consigliati
+CSV storico (sorgente primaria):
+python main.py --csv-path data/ES_5Years_8_11_2024.csv --csv-timezone UTC --markets SP500 --force-close-options none --breakout-windows 10:30 --orb-range-filters small,small+large --rr-targets 1.0,1.5 --trade-direction-modes both
+
+CSV storico con policy prudente esplicita sui 15m incompleti:
+python main.py --csv-path data/ES_5Years_8_11_2024.csv --csv-timezone UTC --m15-incomplete-policy drop --markets SP500 --force-close-options none --breakout-windows 10:30 --orb-range-filters small --rr-targets 1.0 --trade-direction-modes both,long_only,short_only
+
 Focus v1.6:
 python main.py --period 60d --interval 5m --markets SP500 --force-close-options none --breakout-windows 10:30 --orb-range-filters small,small+large --rr-targets 1.0,1.5 --trade-direction-modes both,long_only,short_only
 
