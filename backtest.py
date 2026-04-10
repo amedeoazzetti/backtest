@@ -4,11 +4,13 @@ Backtesting helpers per Opening Range Breakout (ORB) v1.6.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
 
+from audit_utils import TRADE_REPLAY_AUDIT_COLUMNS
 from config import ORBRangeClassConfig, ORBRangeClassResult, ScenarioConfig
 from strategy import ORBConfig, OpeningRangeBreakoutStrategy
 
@@ -30,6 +32,126 @@ class MarketBacktestResult:
     direction_stats: pd.DataFrame
     orb_range_stats: pd.DataFrame
     diagnostics: dict
+    audit_missing_orb_days: pd.DataFrame = field(default_factory=pd.DataFrame)
+    audit_ambiguous_signals: pd.DataFrame = field(default_factory=pd.DataFrame)
+    audit_trade_replay: pd.DataFrame = field(default_factory=pd.DataFrame)
+
+
+def _prepare_candles_for_audit(df: pd.DataFrame, timezone: str = "America/New_York") -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame(columns=["open", "high", "low", "close"])
+
+    working = df.copy()
+    working.columns = [str(c).lower() for c in working.columns]
+    required = ["open", "high", "low", "close"]
+    missing = [c for c in required if c not in working.columns]
+    if missing:
+        return pd.DataFrame(columns=required)
+
+    if not isinstance(working.index, pd.DatetimeIndex):
+        working.index = pd.to_datetime(working.index, errors="coerce")
+
+    working = working[~working.index.isna()]
+    if working.index.tz is None:
+        working.index = working.index.tz_localize("UTC")
+
+    working.index = working.index.tz_convert(ZoneInfo(timezone))
+    working = working.sort_index()
+    working = working[~working.index.duplicated(keep="last")]
+    return working
+
+
+def _audit_time(value: object) -> str | None:
+    if value is None or pd.isna(value):
+        return None
+    return pd.Timestamp(value).strftime("%Y-%m-%d %H:%M:%S %Z")
+
+
+def _extract_candle_ohlc(candles: pd.DataFrame, timestamp_value: object) -> dict[str, float | None]:
+    out = {
+        "open": None,
+        "high": None,
+        "low": None,
+        "close": None,
+    }
+    if timestamp_value is None or pd.isna(timestamp_value) or candles.empty:
+        return out
+
+    ts = pd.Timestamp(timestamp_value)
+    if ts not in candles.index:
+        return out
+
+    row = candles.loc[ts]
+    if isinstance(row, pd.DataFrame):
+        row = row.iloc[0]
+
+    for key in out:
+        value = row.get(key)
+        if value is not None and not pd.isna(value):
+            out[key] = float(value)
+    return out
+
+
+def build_trade_replay_audit(
+    trades: pd.DataFrame,
+    candles_5m: pd.DataFrame,
+    market: str,
+    scenario_label: str,
+    trade_limit: int,
+) -> pd.DataFrame:
+    if trades.empty or trade_limit <= 0:
+        return pd.DataFrame(columns=TRADE_REPLAY_AUDIT_COLUMNS)
+
+    candles = _prepare_candles_for_audit(candles_5m)
+    if candles.empty:
+        return pd.DataFrame(columns=TRADE_REPLAY_AUDIT_COLUMNS)
+
+    subset = trades.sort_values("entry_time").head(trade_limit).copy()
+    rows: list[dict] = []
+
+    for _, trade in subset.iterrows():
+        breakout_ts = pd.to_datetime(trade.get("breakout_candle_time"), errors="coerce")
+        entry_ts = pd.to_datetime(trade.get("entry_time"), errors="coerce")
+        exit_ts = pd.to_datetime(trade.get("exit_time"), errors="coerce")
+
+        breakout_ohlc = _extract_candle_ohlc(candles, breakout_ts)
+        entry_ohlc = _extract_candle_ohlc(candles, entry_ts)
+        exit_ohlc = _extract_candle_ohlc(candles, exit_ts)
+
+        rows.append(
+            {
+                "market": market,
+                "scenario": scenario_label,
+                "trade_date": str(trade.get("date")),
+                "direction": str(trade.get("direction")),
+                "breakout_candle_time": _audit_time(breakout_ts),
+                "entry_time": _audit_time(entry_ts),
+                "entry_price": float(trade.get("entry_price")) if pd.notna(trade.get("entry_price")) else None,
+                "stop_loss": float(trade.get("stop_loss")) if pd.notna(trade.get("stop_loss")) else None,
+                "take_profit": float(trade.get("take_profit")) if pd.notna(trade.get("take_profit")) else None,
+                "exit_time": _audit_time(exit_ts),
+                "exit_reason": str(trade.get("exit_reason")),
+                "orb_high": float(trade.get("orb_high")) if pd.notna(trade.get("orb_high")) else None,
+                "orb_low": float(trade.get("orb_low")) if pd.notna(trade.get("orb_low")) else None,
+                "orb_range_class": str(trade.get("orb_range_class")),
+                "rr_target": float(trade.get("rr_target")) if pd.notna(trade.get("rr_target")) else None,
+                "trade_direction_mode": str(trade.get("trade_direction_mode")),
+                "breakout_candle_open": breakout_ohlc["open"],
+                "breakout_candle_high": breakout_ohlc["high"],
+                "breakout_candle_low": breakout_ohlc["low"],
+                "breakout_candle_close": breakout_ohlc["close"],
+                "entry_candle_open": entry_ohlc["open"],
+                "entry_candle_high": entry_ohlc["high"],
+                "entry_candle_low": entry_ohlc["low"],
+                "entry_candle_close": entry_ohlc["close"],
+                "exit_candle_open": exit_ohlc["open"],
+                "exit_candle_high": exit_ohlc["high"],
+                "exit_candle_low": exit_ohlc["low"],
+                "exit_candle_close": exit_ohlc["close"],
+            }
+        )
+
+    return pd.DataFrame(rows, columns=TRADE_REPLAY_AUDIT_COLUMNS)
 
 
 def _ensure_datetime_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -471,12 +593,13 @@ def _compute_metrics(
 
 def run_market_backtest(
     df: pd.DataFrame,
-    df_15m: pd.DataFrame | None,
     scenario: ScenarioConfig,
     max_trades_per_day: int,
     initial_capital: float,
     risk_per_trade: float,
     orb_range_class_config: ORBRangeClassConfig,
+    audit_mode: bool = False,
+    audit_trades_limit: int = 20,
 ) -> MarketBacktestResult:
     strategy_config = ORBConfig(
         market=scenario.market_label,
@@ -489,11 +612,21 @@ def run_market_backtest(
     )
 
     strategy = OpeningRangeBreakoutStrategy(config=strategy_config)
-    trades, diagnostics = strategy.run(df, df_15m=df_15m)
+    trades, diagnostics = strategy.run(df, audit_mode=audit_mode)
 
     trades = _ensure_datetime_columns(trades)
     if not trades.empty and "breakout_minute_bucket" not in trades.columns:
         trades["breakout_minute_bucket"] = trades["breakout_candle_time"].dt.strftime("%H:%M")
+
+    audit_missing_orb_days = pd.DataFrame(diagnostics.pop("missing_orb_days", []))
+    if not audit_missing_orb_days.empty:
+        audit_missing_orb_days.insert(0, "scenario", scenario.scenario_label)
+        audit_missing_orb_days.insert(0, "market", scenario.market_label)
+
+    audit_ambiguous_signals = pd.DataFrame(diagnostics.pop("ambiguous_signal_rows", []))
+    if not audit_ambiguous_signals.empty:
+        audit_ambiguous_signals.insert(0, "scenario", scenario.scenario_label)
+        audit_ambiguous_signals.insert(0, "market", scenario.market_label)
 
     trades, range_thresholds = classify_orb_range(trades, orb_range_class_config)
     trades, skipped_by_filter = _apply_orb_range_filter(trades, scenario.allowed_orb_range_classes)
@@ -516,6 +649,18 @@ def run_market_backtest(
         breakout_minute_stats=breakout_minute_stats,
         orb_range_stats=orb_range_stats,
         direction_stats=direction_stats,
+    )
+
+    audit_trade_replay = (
+        build_trade_replay_audit(
+            trades=trades,
+            candles_5m=df,
+            market=scenario.market_label,
+            scenario_label=scenario.scenario_label,
+            trade_limit=audit_trades_limit,
+        )
+        if audit_mode
+        else pd.DataFrame(columns=TRADE_REPLAY_AUDIT_COLUMNS)
     )
 
     metrics["market"] = scenario.market_label
@@ -557,6 +702,9 @@ def run_market_backtest(
         direction_stats=direction_stats,
         orb_range_stats=orb_range_stats,
         diagnostics=diagnostics,
+        audit_missing_orb_days=audit_missing_orb_days,
+        audit_ambiguous_signals=audit_ambiguous_signals,
+        audit_trade_replay=audit_trade_replay,
     )
 
 

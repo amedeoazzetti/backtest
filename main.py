@@ -1,16 +1,15 @@
 """
-CLI principale per backtest ORB v1.6.
+CLI principale per backtest ORB (fase M5-only rigorosa).
 
 Esempi:
-    python main.py
-    python main.py --period 60d --interval 5m --markets SP500
-    python main.py --force-close-options none --breakout-windows 10:30 --orb-range-filters small,small+large --rr-targets 1.0,1.5 --trade-direction-modes both,long_only,short_only
-    python main.py --csv-path data/ES_5Years_8_11_2024.csv --csv-timezone UTC --markets SP500
+    python main.py --markets SP500,NASDAQ --breakout-windows 10:00,10:30 --orb-range-filters all,small,small+large --rr-targets 1.0,1.5 --trade-direction-modes both
+    python main.py --csv-path-sp500 data/sp500_5m.csv --csv-path-nasdaq data/nasdaq_5m.csv --csv-timezone UTC --markets SP500,NASDAQ
 """
 
 from __future__ import annotations
 
 import argparse
+from datetime import datetime
 import sys
 from pathlib import Path
 from typing import Any
@@ -23,6 +22,17 @@ except ImportError:
     print("Installa yfinance: pip install yfinance")
     sys.exit(1)
 
+from audit_utils import (
+    AMBIGUOUS_AUDIT_COLUMNS,
+    ORB_RESAMPLE_AUDIT_COLUMNS,
+    TRADE_REPLAY_AUDIT_COLUMNS,
+    build_dataset_audit_summary,
+    audit_missing_orb_days,
+    audit_orb_resampling,
+    parse_audit_dates,
+    save_audit_outputs,
+    select_audit_dates,
+)
 from backtest import format_market_report, performance_per_market, run_market_backtest
 from config import (
     DEFAULT_BREAKOUT_WINDOWS,
@@ -33,6 +43,7 @@ from config import (
     DEFAULT_TRADE_DIRECTION_MODES,
     MARKET_LABELS,
     build_market_scenarios,
+    market_slug,
     parse_breakout_windows,
     parse_force_close_options,
     parse_markets,
@@ -41,7 +52,7 @@ from config import (
     parse_rr_targets,
     parse_trade_direction_modes,
 )
-from data_utils import load_csv_market_data, prepare_external_market_data
+from data_utils import load_m5_csv, prepare_external_market_data
 from reporting import save_scenario_outputs, split_primary_secondary, summarize_outputs
 
 
@@ -65,20 +76,42 @@ def fetch_provider_data(symbol: str, period: str, interval: str) -> pd.DataFrame
     return df
 
 
-def _print_data_diagnostics(market_label: str, diagnostics: dict[str, Any]) -> None:
+def _resolve_market_csv_path(args: argparse.Namespace, market_code: str) -> str | None:
+    if market_code == "SP500" and args.csv_path_sp500:
+        return str(args.csv_path_sp500)
+    if market_code == "NASDAQ" and args.csv_path_nasdaq:
+        return str(args.csv_path_nasdaq)
+    if args.csv_path:
+        return str(args.csv_path)
+    return None
+
+
+def _print_data_diagnostics(
+    market_label: str,
+    diagnostics: dict[str, Any],
+    total_dates: int,
+    valid_orb_dates: int,
+    missing_orb_dates: int,
+) -> None:
     print(f"\nData diagnostics [{market_label}] ({diagnostics.get('data_source', 'unknown')}):")
 
     rows_read = diagnostics.get("csv_rows_read", diagnostics.get("provider_rows_read", 0))
     print(
         "  rows: "
         f"letto={rows_read}, "
-        f"pulito_5m={diagnostics.get('rows_after_cleaning', 0)}, "
-        f"m15_pronto={diagnostics.get('m15_ready_bars', 0)}"
+        f"pulito_5m={diagnostics.get('rows_after_cleaning', 0)}"
     )
     print(
         "  timezone: "
         f"sorgente={diagnostics.get('source_timezone', 'n/a')} -> "
         f"finale={diagnostics.get('target_timezone', 'n/a')}"
+    )
+    print(
+        "  timezone_trace: "
+        f"first_raw={diagnostics.get('source_first_timestamp_raw')}, "
+        f"first_ny={diagnostics.get('target_first_timestamp_converted')}, "
+        f"last_raw={diagnostics.get('source_last_timestamp_raw')}, "
+        f"last_ny={diagnostics.get('target_last_timestamp_converted')}"
     )
     print(
         "  pulizia_5m: "
@@ -88,22 +121,33 @@ def _print_data_diagnostics(market_label: str, diagnostics: dict[str, Any]) -> N
         f"duplicati={diagnostics.get('dropped_duplicate_rows', 0)}"
     )
     print(
-        "  blocchi_15m: "
-        f"totali={diagnostics.get('m15_total_bars', 0)}, "
-        f"incompleti={diagnostics.get('m15_incomplete_bars', 0)}, "
-        f"policy={diagnostics.get('m15_incomplete_policy', 'n/a')}, "
-        f"scartati={diagnostics.get('m15_dropped_incomplete_bars', 0)}"
+        "  orb_daily_check: "
+        f"date_totali={total_dates}, "
+        f"orb_valide={valid_orb_dates}, "
+        f"orb_mancanti={missing_orb_dates}"
     )
-    print(
-        "  orb_0930: "
-        f"presenti={diagnostics.get('m15_orb_0930_bars', 0)}, "
-        f"incomplete={diagnostics.get('m15_orb_0930_incomplete_bars', 0)}"
-    )
+
+
+def _empty_missing_orb_frame(market_label: str) -> pd.DataFrame:
+    return pd.DataFrame(
+        columns=[
+            "market",
+            "trade_date",
+            "reason",
+            "bars_0930_0945_count",
+            "has_0930_5m",
+            "has_0935_5m",
+            "has_0940_5m",
+            "duplicate_orb_time_rows",
+        ]
+    ).assign(market=market_label)
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Backtest ORB v1.6")
-    parser.add_argument("--csv-path", default=None, help="Percorso CSV 5m sorgente primaria")
+    parser = argparse.ArgumentParser(description="Backtest ORB M5-only")
+    parser.add_argument("--csv-path", default=None, help="CSV M5 fallback per tutti i mercati")
+    parser.add_argument("--csv-path-sp500", default=None, help="CSV M5 dedicato per SP500")
+    parser.add_argument("--csv-path-nasdaq", default=None, help="CSV M5 dedicato per NASDAQ")
     parser.add_argument(
         "--csv-timezone",
         default="UTC",
@@ -113,10 +157,32 @@ def main() -> None:
         "--m15-incomplete-policy",
         choices=["drop", "keep"],
         default="drop",
-        help="Gestione blocchi 15m incompleti derivati dal 5m (default: drop)",
+        help="Legacy option (ignorata in modalita M5-only).",
     )
-    parser.add_argument("--period", default="120d", help="Periodo storico (default: 120d)")
-    parser.add_argument("--interval", default="5m", help="Timeframe dati (default: 5m)")
+    parser.add_argument(
+        "--audit-mode",
+        action="store_true",
+        help="Abilita output audit/debug del pipeline dati e della logica ORB",
+    )
+    parser.add_argument(
+        "--audit-sample-days",
+        type=int,
+        default=10,
+        help="Numero giorni campione per audit ORB triplet (default: 10)",
+    )
+    parser.add_argument(
+        "--audit-dates",
+        default=None,
+        help="Date esplicite per audit ORB (YYYY-MM-DD,YYYY-MM-DD)",
+    )
+    parser.add_argument(
+        "--audit-trades-limit",
+        type=int,
+        default=20,
+        help="Numero massimo trade per scenario nel trade replay audit (default: 20)",
+    )
+    parser.add_argument("--period", default="120d", help="Periodo storico provider (default: 120d)")
+    parser.add_argument("--interval", default="5m", help="Timeframe dati provider (default: 5m)")
     parser.add_argument(
         "--markets",
         default=DEFAULT_MARKETS,
@@ -174,6 +240,17 @@ def main() -> None:
         print("Errore parametri: --risk-per-trade deve essere tra 0 e 1")
         sys.exit(1)
 
+    if args.audit_sample_days <= 0:
+        print("Errore parametri: --audit-sample-days deve essere > 0")
+        sys.exit(1)
+
+    if args.audit_trades_limit <= 0:
+        print("Errore parametri: --audit-trades-limit deve essere > 0")
+        sys.exit(1)
+
+    if args.m15_incomplete_policy != "drop":
+        print("Nota: --m15-incomplete-policy e legacy e viene ignorato in modalita M5-only.")
+
     try:
         markets = parse_markets(args.markets)
         force_close_options = parse_force_close_options(args.force_close_options)
@@ -182,31 +259,21 @@ def main() -> None:
         orb_range_quantiles = parse_orb_range_quantiles(args.orb_range_quantiles)
         rr_targets = parse_rr_targets(args.rr_targets)
         trade_direction_modes = parse_trade_direction_modes(args.trade_direction_modes)
+        requested_audit_dates = parse_audit_dates(args.audit_dates)
     except ValueError as exc:
         print(f"Errore parametri: {exc}")
         sys.exit(1)
 
-    if args.csv_path and len(markets) != 1:
-        print("Errore parametri: in modalita CSV specifica un solo mercato per run.")
-        sys.exit(1)
-
     output_dir = Path(args.output_dir)
-    all_results = []
-    drop_incomplete_15m_blocks = args.m15_incomplete_policy == "drop"
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    csv_data_5m = None
-    csv_data_15m = None
-    csv_diagnostics = None
-    if args.csv_path:
-        try:
-            csv_data_5m, csv_data_15m, csv_diagnostics = load_csv_market_data(
-                csv_path=args.csv_path,
-                csv_timezone=args.csv_timezone,
-                drop_incomplete_15m_blocks=drop_incomplete_15m_blocks,
-            )
-        except Exception as exc:
-            print(f"Errore CSV: {exc}")
-            sys.exit(1)
+    all_results = []
+
+    audit_market_summaries: list[dict[str, Any]] = []
+    audit_missing_orb_frames: list[pd.DataFrame] = []
+    audit_orb_resample_frames: list[pd.DataFrame] = []
+    audit_ambiguous_frames: list[pd.DataFrame] = []
+    audit_trade_replay_frames: list[pd.DataFrame] = []
 
     for market_code in markets:
         market_label = MARKET_LABELS[market_code]
@@ -228,41 +295,146 @@ def main() -> None:
         print(f"BACKTEST MERCATO: {market_label} ({symbol})")
         print("#" * 100)
 
+        market_csv_path = _resolve_market_csv_path(args, market_code)
+
         try:
-            if csv_data_5m is not None and csv_data_15m is not None and csv_diagnostics is not None:
-                market_df_5m = csv_data_5m
-                market_df_15m = csv_data_15m
-                data_diagnostics = csv_diagnostics
-                print(f"Uso sorgente CSV: {args.csv_path}")
+            if market_csv_path:
+                print(f"Uso sorgente CSV: {market_csv_path}")
+                market_df_5m, data_diagnostics = load_m5_csv(
+                    csv_path=market_csv_path,
+                    csv_timezone=args.csv_timezone,
+                )
             else:
                 provider_raw = fetch_provider_data(symbol=symbol, period=args.period, interval=args.interval)
-                market_df_5m, market_df_15m, data_diagnostics = prepare_external_market_data(
+                market_df_5m, data_diagnostics = prepare_external_market_data(
                     raw_df=provider_raw,
                     source_timezone_fallback="UTC",
-                    drop_incomplete_15m_blocks=drop_incomplete_15m_blocks,
                 )
         except Exception as exc:
-            source_label = "CSV" if args.csv_path else "download"
+            source_label = "CSV" if market_csv_path else "download"
             print(f"Errore {source_label} {market_label}: {exc}")
             continue
 
-        _print_data_diagnostics(market_label, data_diagnostics)
+        missing_orb_df = audit_missing_orb_days(df_5m=market_df_5m, market_label=market_label)
+        if missing_orb_df.empty:
+            missing_orb_df = _empty_missing_orb_frame(market_label)
+
+        missing_orb_path = output_dir / f"missing_orb_days_{market_slug(market_label)}.csv"
+        missing_orb_df.to_csv(missing_orb_path, index=False)
+
+        all_dates = sorted({ts.date() for ts in pd.DatetimeIndex(market_df_5m.index)})
+        valid_orb_days = max(len(all_dates) - len(missing_orb_df), 0)
+
+        _print_data_diagnostics(
+            market_label=market_label,
+            diagnostics=data_diagnostics,
+            total_dates=len(all_dates),
+            valid_orb_dates=valid_orb_days,
+            missing_orb_dates=len(missing_orb_df),
+        )
+        print(f"  missing_orb_report: {missing_orb_path.name}")
+
+        if args.audit_mode:
+            selected_dates, out_of_range_dates = select_audit_dates(
+                df_5m=market_df_5m,
+                sample_days=args.audit_sample_days,
+                requested_dates=requested_audit_dates,
+            )
+            orb_resample_audit_df = audit_orb_resampling(
+                df_5m=market_df_5m,
+                market_label=market_label,
+                selected_dates=selected_dates,
+            )
+
+            audit_market_summary = build_dataset_audit_summary(
+                market_label=market_label,
+                df_5m=market_df_5m,
+                diagnostics=data_diagnostics,
+                missing_orb_days=missing_orb_df,
+                selected_audit_dates=selected_dates,
+                audit_dates_out_of_range=out_of_range_dates,
+            )
+            audit_market_summaries.append(audit_market_summary)
+            audit_missing_orb_frames.append(missing_orb_df)
+            audit_orb_resample_frames.append(orb_resample_audit_df)
+
+            print(
+                "Audit mode -> "
+                f"missing_orb_days={len(missing_orb_df)}, "
+                f"orb_resample_rows={len(orb_resample_audit_df)}, "
+                f"sample_dates={len(selected_dates)}"
+            )
+            if out_of_range_dates:
+                print(f"Audit mode -> date fuori range ignorate: {', '.join(out_of_range_dates)}")
 
         for scenario in market_scenarios:
             result = run_market_backtest(
                 df=market_df_5m,
-                df_15m=market_df_15m,
                 scenario=scenario,
                 max_trades_per_day=args.max_trades_per_day,
                 initial_capital=args.capital,
                 risk_per_trade=args.risk_per_trade,
                 orb_range_class_config=orb_range_quantiles,
+                audit_mode=args.audit_mode,
+                audit_trades_limit=args.audit_trades_limit,
             )
 
             print("\n" + format_market_report(result))
             paths = save_scenario_outputs(result=result, output_dir=output_dir)
             print(summarize_outputs(paths))
             all_results.append(result)
+
+            if args.audit_mode:
+                if not result.audit_ambiguous_signals.empty:
+                    audit_ambiguous_frames.append(result.audit_ambiguous_signals)
+                if not result.audit_trade_replay.empty:
+                    audit_trade_replay_frames.append(result.audit_trade_replay)
+
+    if args.audit_mode:
+        audit_summary_payload = {
+            "generated_at": datetime.now().isoformat(timespec="seconds"),
+            "audit_mode": True,
+            "audit_options": {
+                "audit_sample_days": args.audit_sample_days,
+                "audit_dates": args.audit_dates,
+                "audit_trades_limit": args.audit_trades_limit,
+            },
+            "markets": audit_market_summaries,
+        }
+
+        audit_missing_orb = (
+            pd.concat(audit_missing_orb_frames, ignore_index=True)
+            if audit_missing_orb_frames
+            else pd.DataFrame()
+        )
+        audit_orb_resample = (
+            pd.concat(audit_orb_resample_frames, ignore_index=True)
+            if audit_orb_resample_frames
+            else pd.DataFrame(columns=ORB_RESAMPLE_AUDIT_COLUMNS)
+        )
+        audit_ambiguous = (
+            pd.concat(audit_ambiguous_frames, ignore_index=True)
+            if audit_ambiguous_frames
+            else pd.DataFrame(columns=AMBIGUOUS_AUDIT_COLUMNS)
+        )
+        audit_trade_replay = (
+            pd.concat(audit_trade_replay_frames, ignore_index=True)
+            if audit_trade_replay_frames
+            else pd.DataFrame(columns=TRADE_REPLAY_AUDIT_COLUMNS)
+        )
+
+        audit_paths = save_audit_outputs(
+            audit_dir=output_dir / "audit",
+            dataset_summary=audit_summary_payload,
+            missing_orb_days=audit_missing_orb,
+            ambiguous_signal_candles=audit_ambiguous,
+            orb_resample_audit=audit_orb_resample,
+            trade_replay_audit=audit_trade_replay,
+        )
+
+        print("\nAudit files salvati:")
+        for path in audit_paths.values():
+            print(f"  - {path}")
 
     print("\n" + "=" * 100)
     print("PERFORMANCE PER MERCATO / SCENARIO")
@@ -272,12 +444,15 @@ def main() -> None:
         print("Nessun risultato disponibile.")
         return
 
+    comparison_path = output_dir / "comparison_summary.csv"
+    table.to_csv(comparison_path, index=False)
+    print(f"Comparison summary salvato: {comparison_path}")
+
     primary, secondary = split_primary_secondary(table)
 
     if not primary.empty:
         print(
-            "\nScenari focus v1.6 (SP500, no_time_close, 10:30, "
-            "small|small+large, RR 1.0|1.5, both|long_only|short_only):"
+            "\nScenari focus (SP500/NASDAQ, 10:00|10:30, all|small|small+large, RR 1.0|1.5, both):"
         )
         print(primary.to_string(index=False))
 

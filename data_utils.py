@@ -1,11 +1,13 @@
 """
-Data utilities for ORB backtesting.
+Data utilities for ORB backtesting (M5-only architecture).
 
 Primary workflow:
-- load 5m data (CSV or external provider)
-- normalize to clean OHLCV in America/New_York
-- resample to 15m for ORB candle detection
-- validate 15m block completeness (3x5m per 15m candle)
+- load and clean M5 data (CSV or external provider)
+- convert timestamps to America/New_York
+- build ORB from the exact 09:30 / 09:35 / 09:40 M5 triplet
+
+Legacy note:
+- the old 15m-resample path is no longer the primary engine path.
 """
 
 from __future__ import annotations
@@ -21,6 +23,7 @@ import pandas as pd
 TARGET_TIMEZONE = "America/New_York"
 OHLC_COLUMNS = ["open", "high", "low", "close"]
 OHLCV_COLUMNS = ["open", "high", "low", "close", "volume"]
+ORB_REQUIRED_TIMES = (time(9, 30), time(9, 35), time(9, 40))
 
 
 def _resolve_timezone(name: str) -> ZoneInfo:
@@ -42,6 +45,16 @@ def _parse_datetime_series(values: pd.Series) -> pd.Series:
     return parsed
 
 
+def _date_strings_from_index(index_values: pd.Index) -> set[str]:
+    idx = pd.to_datetime(index_values, errors="coerce")
+    out: set[str] = set()
+    for ts in idx:
+        if pd.isna(ts):
+            continue
+        out.add(pd.Timestamp(ts).date().isoformat())
+    return out
+
+
 def normalize_5m_dataframe(
     raw_df: pd.DataFrame,
     source_timezone: str,
@@ -58,6 +71,12 @@ def normalize_5m_dataframe(
 
     working = raw_df.copy()
     rows_input = int(len(working))
+    anomaly_dates: set[str] = set()
+
+    source_first_timestamp_raw: Optional[str] = None
+    source_last_timestamp_raw: Optional[str] = None
+    source_first_timestamp_parsed: Optional[str] = None
+    source_last_timestamp_parsed: Optional[str] = None
 
     dropped_bad_datetime_rows = 0
     if time_column is not None:
@@ -70,9 +89,18 @@ def normalize_5m_dataframe(
             )
 
         source_time_col = column_lookup[requested]
-        parsed_time = _parse_datetime_series(working[source_time_col])
+        source_time_text = working[source_time_col].astype(str).str.strip()
+        parsed_time = _parse_datetime_series(source_time_text)
         keep_mask = ~parsed_time.isna()
         dropped_bad_datetime_rows = int((~keep_mask).sum())
+
+        valid_source_text = source_time_text.loc[keep_mask]
+        valid_parsed_time = parsed_time.loc[keep_mask]
+        if not valid_parsed_time.empty:
+            source_first_timestamp_raw = str(valid_source_text.iloc[0])
+            source_last_timestamp_raw = str(valid_source_text.iloc[-1])
+            source_first_timestamp_parsed = pd.Timestamp(valid_parsed_time.iloc[0]).isoformat()
+            source_last_timestamp_parsed = pd.Timestamp(valid_parsed_time.iloc[-1]).isoformat()
 
         working = working.loc[keep_mask].copy()
         parsed_time = parsed_time.loc[keep_mask]
@@ -82,9 +110,19 @@ def normalize_5m_dataframe(
         if not isinstance(working.index, pd.DatetimeIndex):
             raise ValueError("Il DataFrame deve avere DatetimeIndex oppure la colonna Time.")
 
-        parsed_index = pd.to_datetime(working.index, errors="coerce")
+        raw_index_values = pd.Index(working.index)
+        parsed_index = pd.to_datetime(raw_index_values, errors="coerce")
         keep_mask = ~parsed_index.isna()
         dropped_bad_datetime_rows = int((~keep_mask).sum())
+
+        valid_raw_index = raw_index_values[keep_mask]
+        valid_parsed_index = parsed_index[keep_mask]
+        if len(valid_parsed_index) > 0:
+            source_first_timestamp_raw = str(valid_raw_index[0])
+            source_last_timestamp_raw = str(valid_raw_index[-1])
+            source_first_timestamp_parsed = pd.Timestamp(valid_parsed_index[0]).isoformat()
+            source_last_timestamp_parsed = pd.Timestamp(valid_parsed_index[-1]).isoformat()
+
         working = working.loc[keep_mask].copy()
         parsed_index = parsed_index[keep_mask]
         working.index = pd.DatetimeIndex(parsed_index, name="time")
@@ -108,6 +146,8 @@ def normalize_5m_dataframe(
 
     bad_ohlc_mask = working[OHLC_COLUMNS].isna().any(axis=1)
     dropped_bad_ohlc_rows = int(bad_ohlc_mask.sum())
+    if dropped_bad_ohlc_rows:
+        anomaly_dates.update(_date_strings_from_index(working.index[bad_ohlc_mask]))
     working = working.loc[~bad_ohlc_mask].copy()
 
     volume_nan_rows = int(working["volume"].isna().sum())
@@ -116,10 +156,15 @@ def normalize_5m_dataframe(
 
     bad_high_low_mask = working["high"] < working["low"]
     dropped_bad_high_low_rows = int(bad_high_low_mask.sum())
+    if dropped_bad_high_low_rows:
+        anomaly_dates.update(_date_strings_from_index(working.index[bad_high_low_mask]))
     working = working.loc[~bad_high_low_mask].copy()
 
     working = working.sort_index()
-    duplicated_before_tz = int(working.index.duplicated(keep="last").sum())
+    duplicate_mask_before_tz = working.index.duplicated(keep="last")
+    duplicated_before_tz = int(duplicate_mask_before_tz.sum())
+    if duplicated_before_tz:
+        anomaly_dates.update(_date_strings_from_index(working.index[duplicate_mask_before_tz]))
     if duplicated_before_tz:
         working = working[~working.index.duplicated(keep="last")].copy()
 
@@ -141,12 +186,18 @@ def normalize_5m_dataframe(
     working.index = working.index.tz_convert(target_tz)
     working = working.sort_index()
 
-    duplicated_after_tz = int(working.index.duplicated(keep="last").sum())
+    duplicate_mask_after_tz = working.index.duplicated(keep="last")
+    duplicated_after_tz = int(duplicate_mask_after_tz.sum())
+    if duplicated_after_tz:
+        anomaly_dates.update(_date_strings_from_index(working.index[duplicate_mask_after_tz]))
     if duplicated_after_tz:
         working = working[~working.index.duplicated(keep="last")].copy()
 
     if working.empty:
         raise ValueError("Dataset vuoto dopo la pulizia dei dati 5m.")
+
+    target_first_timestamp_converted = pd.Timestamp(working.index[0]).isoformat()
+    target_last_timestamp_converted = pd.Timestamp(working.index[-1]).isoformat()
 
     diagnostics = {
         "rows_input": rows_input,
@@ -160,78 +211,24 @@ def normalize_5m_dataframe(
         "timestamps_were_tz_aware": bool(timestamps_were_tz_aware),
         "source_timezone": source_timezone,
         "target_timezone": target_timezone,
+        "source_first_timestamp_raw": source_first_timestamp_raw,
+        "source_last_timestamp_raw": source_last_timestamp_raw,
+        "source_first_timestamp_parsed": source_first_timestamp_parsed,
+        "source_last_timestamp_parsed": source_last_timestamp_parsed,
+        "target_first_timestamp_converted": target_first_timestamp_converted,
+        "target_last_timestamp_converted": target_last_timestamp_converted,
+        "dates_with_anomalies": sorted(anomaly_dates),
     }
     return working, diagnostics
 
 
-def resample_to_15m(df_5m: pd.DataFrame) -> pd.DataFrame:
-    """Resample a cleaned 5m dataframe to 15m OHLCV with source bar count."""
-    if df_5m.empty:
-        raise ValueError("Impossibile resamplare: dataset 5m vuoto.")
-
-    missing = sorted(set(OHLCV_COLUMNS).difference(df_5m.columns))
-    if missing:
-        raise ValueError(f"Impossibile resamplare a 15m, colonne mancanti: {', '.join(missing)}")
-
-    m15 = (
-        df_5m.resample("15min", label="left", closed="left")
-        .agg(
-            open=("open", "first"),
-            high=("high", "max"),
-            low=("low", "min"),
-            close=("close", "last"),
-            volume=("volume", "sum"),
-            source_5m_count=("close", "count"),
-        )
-        .dropna(subset=OHLC_COLUMNS)
-    )
-
-    m15["source_5m_count"] = pd.to_numeric(m15["source_5m_count"], errors="coerce").fillna(0).astype(int)
-    m15["is_complete_block"] = m15["source_5m_count"] == 3
-    return m15
-
-
-def validate_15m_blocks(
-    df_15m: pd.DataFrame,
-    orb_start: time = time(9, 30),
-) -> dict[str, Any]:
-    """Validate completeness and alignment of 15m candles."""
-    if df_15m.empty:
-        return {
-            "m15_total_bars": 0,
-            "m15_incomplete_bars": 0,
-            "m15_complete_bars": 0,
-            "m15_misaligned_bars": 0,
-            "m15_orb_0930_bars": 0,
-            "m15_orb_0930_incomplete_bars": 0,
-        }
-
-    if "source_5m_count" not in df_15m.columns:
-        raise ValueError("validate_15m_blocks richiede la colonna source_5m_count.")
-
-    counts = pd.to_numeric(df_15m["source_5m_count"], errors="coerce").fillna(0)
-    incomplete_mask = counts < 3
-    misaligned_mask = (df_15m.index.minute % 15) != 0
-    orb_mask = pd.Index(df_15m.index.time) == orb_start
-
-    return {
-        "m15_total_bars": int(len(df_15m)),
-        "m15_incomplete_bars": int(incomplete_mask.sum()),
-        "m15_complete_bars": int((~incomplete_mask).sum()),
-        "m15_misaligned_bars": int(misaligned_mask.sum()),
-        "m15_orb_0930_bars": int(orb_mask.sum()),
-        "m15_orb_0930_incomplete_bars": int((incomplete_mask & orb_mask).sum()),
-    }
-
-
-def _build_5m_and_15m(
+def _build_clean_m5(
     raw_df: pd.DataFrame,
     source_timezone: str,
     source_label: str,
     time_column: Optional[str],
     require_volume: bool,
-    drop_incomplete_15m_blocks: bool,
-) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
+) -> tuple[pd.DataFrame, dict[str, Any]]:
     clean_5m, clean_diag = normalize_5m_dataframe(
         raw_df=raw_df,
         source_timezone=source_timezone,
@@ -240,38 +237,117 @@ def _build_5m_and_15m(
         require_volume=require_volume,
     )
 
-    m15_full = resample_to_15m(clean_5m)
-    m15_diag = validate_15m_blocks(m15_full)
-
-    incomplete_policy = "drop" if drop_incomplete_15m_blocks else "keep"
-    dropped_incomplete_bars = 0
-    if drop_incomplete_15m_blocks:
-        incomplete_mask = ~m15_full["is_complete_block"]
-        dropped_incomplete_bars = int(incomplete_mask.sum())
-        m15_ready = m15_full.loc[~incomplete_mask].copy()
-    else:
-        m15_ready = m15_full.copy()
-
-    if m15_ready.empty:
-        raise ValueError("Nessuna candela 15m valida dopo il controllo completezza blocchi.")
-
     diagnostics = {
         "data_source": source_label,
         **clean_diag,
-        **m15_diag,
-        "m15_incomplete_policy": incomplete_policy,
-        "m15_dropped_incomplete_bars": dropped_incomplete_bars,
-        "m15_ready_bars": int(len(m15_ready)),
     }
-    return clean_5m, m15_ready, diagnostics
+    return clean_5m, diagnostics
 
 
-def load_csv_market_data(
+def _single_bar_for_time(day_5m: pd.DataFrame, bar_time: time) -> tuple[pd.Timestamp | None, pd.Series | None, int]:
+    bars = day_5m[day_5m.index.time == bar_time]
+    if bars.empty:
+        return None, None, 0
+    if len(bars) > 1:
+        return pd.Timestamp(bars.index[0]), bars.iloc[0], len(bars)
+    return pd.Timestamp(bars.index[0]), bars.iloc[0], 1
+
+
+def validate_orb_triplet(
+    day_5m: pd.DataFrame,
+    orb_start: time = time(9, 30),
+) -> dict[str, Any]:
+    """Validate and build ORB candle directly from 09:30/09:35/09:40 M5 bars."""
+    result: dict[str, Any] = {
+        "is_valid": False,
+        "reason": "unknown",
+        "bars_0930_0945_count": 0,
+        "has_0930_5m": False,
+        "has_0935_5m": False,
+        "has_0940_5m": False,
+        "duplicate_orb_time_rows": 0,
+        "source_0930_time": None,
+        "source_0935_time": None,
+        "source_0940_time": None,
+        "orb_open": None,
+        "orb_high": None,
+        "orb_low": None,
+        "orb_close": None,
+        "orb_volume": None,
+    }
+
+    if day_5m is None or day_5m.empty:
+        result["reason"] = "all_5m_missing"
+        return result
+
+    orb_end = time(9, 45)
+    window = day_5m[(day_5m.index.time >= orb_start) & (day_5m.index.time < orb_end)]
+    result["bars_0930_0945_count"] = int(len(window))
+
+    if window.empty:
+        result["reason"] = "session_missing"
+        return result
+
+    t930, b930, dup930 = _single_bar_for_time(day_5m, time(9, 30))
+    t935, b935, dup935 = _single_bar_for_time(day_5m, time(9, 35))
+    t940, b940, dup940 = _single_bar_for_time(day_5m, time(9, 40))
+
+    result["has_0930_5m"] = b930 is not None
+    result["has_0935_5m"] = b935 is not None
+    result["has_0940_5m"] = b940 is not None
+    result["duplicate_orb_time_rows"] = int(max(dup930 - 1, 0) + max(dup935 - 1, 0) + max(dup940 - 1, 0))
+    result["source_0930_time"] = t930
+    result["source_0935_time"] = t935
+    result["source_0940_time"] = t940
+
+    if result["duplicate_orb_time_rows"] > 0:
+        result["reason"] = "duplicate_orb_bar"
+        return result
+
+    source_complete = bool(b930 is not None and b935 is not None and b940 is not None)
+    if not source_complete:
+        expected_minutes = {30, 35, 40}
+        observed_minutes = {int(ts.minute) for ts in pd.DatetimeIndex(window.index)}
+        if observed_minutes and observed_minutes.difference(expected_minutes):
+            result["reason"] = "timezone_alignment_issue"
+        else:
+            result["reason"] = "incomplete_0930_block"
+        return result
+
+    if int(len(window)) != 3:
+        result["reason"] = "incomplete_0930_block"
+        return result
+
+    orb_open = float(b930["open"])
+    orb_high = float(max(b930["high"], b935["high"], b940["high"]))
+    orb_low = float(min(b930["low"], b935["low"], b940["low"]))
+    orb_close = float(b940["close"])
+    orb_volume = float(b930.get("volume", 0.0) + b935.get("volume", 0.0) + b940.get("volume", 0.0))
+
+    if orb_high < orb_low:
+        result["reason"] = "invalid_orb_range"
+        return result
+
+    result["is_valid"] = True
+    result["reason"] = ""
+    result["orb_open"] = orb_open
+    result["orb_high"] = orb_high
+    result["orb_low"] = orb_low
+    result["orb_close"] = orb_close
+    result["orb_volume"] = orb_volume
+    return result
+
+
+def build_daily_orb_from_m5(day_5m: pd.DataFrame) -> dict[str, Any]:
+    """Build daily ORB directly from required M5 triplet."""
+    return validate_orb_triplet(day_5m=day_5m, orb_start=time(9, 30))
+
+
+def load_m5_csv(
     csv_path: str | Path,
     csv_timezone: str,
-    drop_incomplete_15m_blocks: bool = True,
-) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
-    """Load CSV 5m data and derive clean 5m + validated 15m datasets."""
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """Load CSV and return cleaned M5 dataset in America/New_York."""
     path = Path(csv_path)
     if not path.exists():
         raise FileNotFoundError(f"File CSV non trovato: {path}")
@@ -286,34 +362,43 @@ def load_csv_market_data(
     if raw_df.empty:
         raise ValueError(f"CSV vuoto o senza righe valide: {path}")
 
-    clean_5m, m15_ready, diagnostics = _build_5m_and_15m(
+    clean_5m, diagnostics = _build_clean_m5(
         raw_df=raw_df,
         source_timezone=csv_timezone,
         source_label="csv",
         time_column="Time",
         require_volume=True,
-        drop_incomplete_15m_blocks=drop_incomplete_15m_blocks,
     )
 
     diagnostics["csv_path"] = str(path)
     diagnostics["csv_rows_read"] = int(len(raw_df))
-    return clean_5m, m15_ready, diagnostics
+    return clean_5m, diagnostics
+
+
+def load_csv_market_data(
+    csv_path: str | Path,
+    csv_timezone: str,
+    drop_incomplete_15m_blocks: bool = True,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """Compatibility wrapper: use load_m5_csv in M5-only architecture."""
+    _ = drop_incomplete_15m_blocks
+    return load_m5_csv(csv_path=csv_path, csv_timezone=csv_timezone)
 
 
 def prepare_external_market_data(
     raw_df: pd.DataFrame,
     source_timezone_fallback: str = "UTC",
     drop_incomplete_15m_blocks: bool = True,
-) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
-    """Normalize provider 5m data and derive validated 15m bars."""
-    clean_5m, m15_ready, diagnostics = _build_5m_and_15m(
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """Normalize provider data and return cleaned M5 dataset in America/New_York."""
+    _ = drop_incomplete_15m_blocks
+    clean_5m, diagnostics = _build_clean_m5(
         raw_df=raw_df,
         source_timezone=source_timezone_fallback,
         source_label="provider",
         time_column=None,
         require_volume=False,
-        drop_incomplete_15m_blocks=drop_incomplete_15m_blocks,
     )
 
     diagnostics["provider_rows_read"] = int(len(raw_df))
-    return clean_5m, m15_ready, diagnostics
+    return clean_5m, diagnostics

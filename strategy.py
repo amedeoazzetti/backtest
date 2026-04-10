@@ -21,6 +21,8 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
+from data_utils import build_daily_orb_from_m5
+
 
 TRADE_COLUMNS = [
     "date",
@@ -211,68 +213,23 @@ class OpeningRangeBreakoutStrategy:
         working = working[working["high"] >= working["low"]]
         return working
 
-    def prepare_m15_dataframe(self, df: pd.DataFrame) -> pd.DataFrame:
-        if not isinstance(df.index, pd.DatetimeIndex):
-            raise ValueError("Il DataFrame 15m deve avere un DatetimeIndex.")
-
-        working = df.copy()
-        working.columns = [str(c).lower() for c in working.columns]
-        required = {"open", "high", "low", "close"}
-        missing = required.difference(working.columns)
-        if missing:
-            missing_cols = ", ".join(sorted(missing))
-            raise ValueError(f"Colonne OHLC mancanti nel DataFrame 15m: {missing_cols}")
-
-        working = working.sort_index()
-        working = working[~working.index.duplicated(keep="last")]
-
-        if working.index.tz is None:
-            working.index = working.index.tz_localize("UTC")
-
-        working.index = working.index.tz_convert(self.ny_tz)
-
-        rows_before = len(working)
-        working = working.dropna(subset=["open", "high", "low", "close"])
-        self.rows_dropped_nan += rows_before - len(working)
-        working = working[working["high"] >= working["low"]]
-        return working
-
-    def set_opening_range(
-        self,
-        day_frame_5m: pd.DataFrame,
-        day_frame_15m: Optional[pd.DataFrame] = None,
-    ) -> bool:
-        # ORB M15 derivata da dataset 15m dedicato, fallback su resample da 5m.
-        if day_frame_15m is not None:
-            m15 = day_frame_15m
-        else:
-            m15 = (
-                day_frame_5m.resample("15min", label="left", closed="left")
-                .agg({"open": "first", "high": "max", "low": "min", "close": "last"})
-                .dropna(subset=["open", "high", "low", "close"])
-            )
-
-        orb_rows = m15[m15.index.time == self.config.orb_start]
-        if orb_rows.empty:
+    def set_opening_range(self, day_frame_5m: pd.DataFrame) -> tuple[bool, str]:
+        orb_info = build_daily_orb_from_m5(day_frame_5m)
+        if not orb_info.get("is_valid", False):
             self.session_active = False
-            return False
+            if orb_info.get("reason") in {"incomplete_0930_block", "duplicate_orb_bar"}:
+                self.incomplete_orb_bars += 1
+            return False, str(orb_info.get("reason") or "unknown")
 
-        orb_candle = orb_rows.iloc[0]
-        source_5m_count = orb_candle.get("source_5m_count", None)
-        if source_5m_count is not None and float(source_5m_count) < 3:
-            self.incomplete_orb_bars += 1
-            self.session_active = False
-            return False
-
-        self.orb_high = float(orb_candle["high"])
-        self.orb_low = float(orb_candle["low"])
+        self.orb_high = float(orb_info["orb_high"])
+        self.orb_low = float(orb_info["orb_low"])
         self.orb_range = self.orb_high - self.orb_low
 
         if self.orb_range <= 0:
             self.session_active = False
-            return False
+            return False, "invalid_orb_range"
 
-        return True
+        return True, ""
 
     def check_long_signal(self, m5_candle: pd.Series) -> bool:
         return bool(
@@ -543,10 +500,13 @@ class OpeningRangeBreakoutStrategy:
     def run(
         self,
         df: pd.DataFrame,
-        df_15m: Optional[pd.DataFrame] = None,
+        audit_mode: bool = False,
     ) -> tuple[pd.DataFrame, dict[str, Any]]:
         data = self.prepare_dataframe(df)
-        m15_data = self.prepare_m15_dataframe(df_15m) if df_15m is not None else None
+
+        audit_missing_orb_days: list[dict[str, Any]] = []
+        audit_ambiguous_signals: list[dict[str, Any]] = []
+
         if data.empty:
             empty = pd.DataFrame(columns=TRADE_COLUMNS)
             diagnostics = {
@@ -557,14 +517,12 @@ class OpeningRangeBreakoutStrategy:
                 "incomplete_orb_bars": 0,
                 "days_processed": 0,
             }
+            if audit_mode:
+                diagnostics["missing_orb_days"] = audit_missing_orb_days
+                diagnostics["ambiguous_signal_rows"] = audit_ambiguous_signals
             return empty, diagnostics
 
         day_groups = {day: frame for day, frame in data.groupby(data.index.date)}
-        day_groups_m15 = (
-            {day: frame for day, frame in m15_data.groupby(m15_data.index.date)}
-            if m15_data is not None
-            else {}
-        )
         trades: list[TradeRecord] = []
 
         for i in range(len(data)):
@@ -577,10 +535,16 @@ class OpeningRangeBreakoutStrategy:
                 self.current_day = session_day
                 day_frame = day_groups.get(session_day)
                 if day_frame is not None:
-                    day_frame_m15 = day_groups_m15.get(session_day)
-                    has_orb = self.set_opening_range(day_frame, day_frame_m15)
+                    has_orb, missing_reason = self.set_opening_range(day_frame)
                     if not has_orb:
                         self.days_missing_orb += 1
+                        if audit_mode:
+                            audit_missing_orb_days.append(
+                                {
+                                    "trade_date": session_day.isoformat(),
+                                    "reason": missing_reason or "unknown",
+                                }
+                            )
 
             closed_trade = self.manage_open_trade(candle_time, candle)
             if closed_trade is not None:
@@ -619,6 +583,29 @@ class OpeningRangeBreakoutStrategy:
             touched_upper, touched_lower = self._update_breakout_state(candle)
             if touched_upper and touched_lower:
                 self.ambiguous_signal_candles += 1
+                if audit_mode:
+                    if float(candle["close"]) > float(self.orb_high):
+                        direction_candidate = "LONG"
+                    elif float(candle["close"]) < float(self.orb_low):
+                        direction_candidate = "SHORT"
+                    else:
+                        direction_candidate = "BOTH_UNCLEAR"
+
+                    audit_ambiguous_signals.append(
+                        {
+                            "trade_date": session_day.isoformat(),
+                            "candle_time_ny": candle_time.strftime("%Y-%m-%d %H:%M:%S %Z"),
+                            "direction_candidate": direction_candidate,
+                            "orb_high": float(self.orb_high),
+                            "orb_low": float(self.orb_low),
+                            "candle_open": float(candle["open"]),
+                            "candle_high": float(candle["high"]),
+                            "candle_low": float(candle["low"]),
+                            "candle_close": float(candle["close"]),
+                            "ambiguity_reason": "touched_both_orb_sides_same_candle",
+                            "how_strategy_handled_it": "skipped_signal_candle",
+                        }
+                    )
                 continue
 
             if self.check_long_signal(candle) and is_direction_allowed(
@@ -659,4 +646,7 @@ class OpeningRangeBreakoutStrategy:
             "incomplete_orb_bars": int(self.incomplete_orb_bars),
             "days_processed": len(day_groups),
         }
+        if audit_mode:
+            diagnostics["missing_orb_days"] = audit_missing_orb_days
+            diagnostics["ambiguous_signal_rows"] = audit_ambiguous_signals
         return trades_df, diagnostics

@@ -1,124 +1,86 @@
-# ORB Backtester v1.6 (Directional Simulation Modes)
+# ORB Backtester (M5-Only Phase)
 
-## Obiettivo
-La v1.6 mantiene invariata la logica ORB e aggiunge la simulazione per direzione:
-- both
-- long_only
-- short_only
+## Obiettivo Nuova Fase
+Il progetto ora usa una base piu rigorosa e semplice:
+- sorgente unica di verita: dati M5
+- ORB costruita direttamente da 3 candele M5 (09:30, 09:35, 09:40 New York)
+- confronto robusto su storico lungo tra SP500 e NASDAQ
 
-Focus operativo principale:
-- market: SP500
-- force close: no_time_close
-- breakout window: 10:30
-- orb filters: small, small+large
-- rr targets: 1.0, 1.5
-- trade direction modes: both, long_only, short_only
+Non viene piu usato un dataset 15m separato come base primaria del motore.
 
-## Logica Trading (invariata)
-- Timezone: America/New_York
-- Opening range: candela 09:30-09:45 (M15 da dati 5m)
-- Breakout confermato su M5
-- Entry su open candela successiva
-- Stop loss sul lato opposto del range
-- Take profit con RR target configurabile
+## Logica ORB (M5-Only)
+Per ogni giornata (America/New_York), la ORB 09:30-09:45 viene costruita da:
+- candela 09:30
+- candela 09:35
+- candela 09:40
 
-## Nuova Sorgente Dati CSV 5m
-Il backtester supporta una modalita sorgente primaria da CSV storico.
+Regole:
+- open = open 09:30
+- high = max(high 09:30, 09:35, 09:40)
+- low = min(low 09:30, 09:35, 09:40)
+- close = close 09:40
+- volume = somma volumi delle 3 candele
 
-Nuovi parametri CLI:
-- --csv-path data/ES_5Years_8_11_2024.csv
-- --csv-timezone UTC
-- --m15-incomplete-policy drop|keep
+Se il triplet non e valido (buchi, duplicati, allineamento errato), la giornata non viene tradata.
 
-Comportamento:
-- se --csv-path e presente, i dati vengono letti dal CSV invece del provider esterno
-- i timestamp sono interpretati usando --csv-timezone
-- i dati vengono poi convertiti internamente in America/New_York
-
-CSV atteso (colonne):
+## Input Dati
+### CSV storico M5
+CSV atteso con colonne:
 - Time, Open, High, Low, Close, Volume
 
-Pipeline dati:
-- parsing robusto datetime
-- sort cronologico
-- rimozione duplicati
-- conversione numerica OHLCV
-- scarto righe malformate/NaN
-- controllo high >= low
+Parametri principali:
+- --csv-path (fallback unico)
+- --csv-path-sp500 (CSV dedicato SP500)
+- --csv-path-nasdaq (CSV dedicato NASDAQ)
+- --csv-timezone (timezone dei timestamp in input, es: UTC)
 
-Diagnostica in log:
-- righe lette dal CSV
-- righe dopo pulizia
-- timezone sorgente/finale
-- candele 15m create
-- blocchi 15m incompleti e policy applicata
+### Provider esterno (fallback)
+Se non passi CSV per un mercato, il tool prova a scaricare via provider esterno.
 
-## Resampling 15m Da 5m
-Il 15m viene derivato dal 5m con regole OHLCV standard:
-- Open: prima open del blocco
-- High: max high del blocco
-- Low: min low del blocco
-- Close: ultima close del blocco
-- Volume: somma volumi del blocco
+## Matrice Focus (Nuova Fase)
+Default orientati al confronto SP500 vs NASDAQ:
+- markets: SP500,NASDAQ
+- breakout windows: 10:00,10:30
+- orb range filters: all,small,small+large
+- rr targets: 1.0,1.5
+- trade direction modes: both
 
-Allineamento:
-- resample a 15 minuti con ancoraggio ai quarti d'ora reali
-- in timezone America/New_York
-- quindi la candela ORB 09:30-09:45 e allineata correttamente
+## Audit Minimo Integrato
+Per ogni mercato il programma stampa e traccia:
+- righe M5 lette
+- righe valide dopo pulizia
+- timezone sorgente e finale
+- giornate con ORB valida
+- giornate senza ORB valida
 
-Qualita blocchi 15m:
-- ogni candela 15m tiene il conteggio delle candele 5m sorgenti
-- blocco completo ideale: 3 candele 5m
-- con --m15-incomplete-policy drop (default) i blocchi incompleti vengono scartati
-- con --m15-incomplete-policy keep vengono mantenuti e segnalati nei log
+Output dedicato per mercato:
+- outputs/missing_orb_days_sp500.csv
+- outputs/missing_orb_days_nasdaq.csv
 
-## RR Target
-Parametro CLI:
-- --rr-targets 1.0,1.5
+Colonna reason in missing_orb_days:
+- no_0930_bar
+- incomplete_0930_block
+- session_missing
+- all_5m_missing
+- timezone_alignment_issue
+- duplicate_orb_bar
+- unknown
 
-Calcolo TP:
-- LONG:
-  - risk = entry_price - stop_loss
-  - take_profit = entry_price + risk * rr_target
-- SHORT:
-  - risk = stop_loss - entry_price
-  - take_profit = entry_price - risk * rr_target
+## Audit Mode (Opzionale)
+Abilita diagnostica estesa:
+- --audit-mode
+- --audit-sample-days 10
+- --audit-dates 2024-08-01,2024-08-02
+- --audit-trades-limit 20
 
-## Trade Direction Modes
-Nuovo parametro CLI:
-- --trade-direction-modes both,long_only,short_only
+File generati in outputs/audit:
+- dataset_audit_summary.json
+- missing_orb_days.csv
+- ambiguous_signal_candles.csv
+- orb_resample_audit.csv
+- trade_replay_audit.csv
 
-Comportamento:
-- both: accetta segnali LONG e SHORT
-- long_only: accetta solo segnali LONG
-- short_only: accetta solo segnali SHORT
-
-La modalita e parte dello scenario: il backtest viene simulato separatamente per ciascuna modalita.
-
-## Scenario Naming
-Ogni scenario include:
-- breakout window
-- force close
-- orb filter
-- rr target
-- trade direction mode
-
-Esempio:
-- breakout_window_0945_1030_no_time_close_orb_small_rr_1_5_both
-- breakout_window_0945_1030_no_time_close_orb_small_rr_1_5_long_only
-- breakout_window_0945_1030_no_time_close_orb_small_rr_1_5_short_only
-
-## Trade Log
-Ogni trade include esplicitamente:
-- rr_target
-- trade_direction_mode
-
-Restano coerenti:
-- risk_points
-- reward_points
-- result_r
-
-## Output in /outputs
+## Output Backtest
 Per ogni scenario:
 - trades_<market>_<scenario>.csv
 - metrics_<market>_<scenario>.json
@@ -128,51 +90,15 @@ Per ogni scenario:
 - direction_stats_<market>_<scenario>.csv
 - orb_range_stats_<market>_<scenario>.csv
 
-Esempi:
-- trades_sp500_breakout_window_0945_1030_no_time_close_orb_small_rr_1_5_short_only.csv
-- metrics_sp500_breakout_window_0945_1030_no_time_close_orb_small_plus_large_rr_1_0_long_only.json
+Output comparativo aggregato:
+- outputs/comparison_summary.csv
 
-## Tabella Finale
-Include anche:
-- trade_direction_mode
-- rr_target
+## Esempi CLI
+Confronto completo SP500 + NASDAQ con CSV separati:
+python main.py --csv-path-sp500 data/sp500_5m.csv --csv-path-nasdaq data/nasdaq_5m.csv --csv-timezone UTC --markets SP500,NASDAQ --force-close-options none --breakout-windows 10:00,10:30 --orb-range-filters all,small,small+large --rr-targets 1.0,1.5 --trade-direction-modes both
 
-E mantiene:
-- total_trades
-- win_rate
-- profit_factor
-- average_r
-- total_r
-- max_drawdown
-- final_equity
-- long_trades
-- short_trades
-- long_avg_r
-- short_avg_r
-- long_total_r
-- short_total_r
+Confronto su un solo CSV (fallback):
+python main.py --csv-path data/ES_5Years_8_11_2024.csv --csv-timezone UTC --markets SP500 --force-close-options none --breakout-windows 10:00,10:30 --orb-range-filters all,small,small+large --rr-targets 1.0,1.5 --trade-direction-modes both
 
-## Robustezza
-Gestione edge cases:
-- modalita direzione non valida
-- rr target non valido
-- scenari senza trade
-- zero long o zero short
-- metriche non calcolabili
-- output vuoti ma coerenti
-
-## Comandi CLI consigliati
-CSV storico (sorgente primaria):
-python main.py --csv-path data/ES_5Years_8_11_2024.csv --csv-timezone UTC --markets SP500 --force-close-options none --breakout-windows 10:30 --orb-range-filters small,small+large --rr-targets 1.0,1.5 --trade-direction-modes both
-
-CSV storico con policy prudente esplicita sui 15m incompleti:
-python main.py --csv-path data/ES_5Years_8_11_2024.csv --csv-timezone UTC --m15-incomplete-policy drop --markets SP500 --force-close-options none --breakout-windows 10:30 --orb-range-filters small --rr-targets 1.0 --trade-direction-modes both,long_only,short_only
-
-Focus v1.6:
-python main.py --period 60d --interval 5m --markets SP500 --force-close-options none --breakout-windows 10:30 --orb-range-filters small,small+large --rr-targets 1.0,1.5 --trade-direction-modes both,long_only,short_only
-
-Confronto RR esteso mantenendo direzioni:
-python main.py --period 60d --interval 5m --markets SP500 --force-close-options none --breakout-windows 10:30 --orb-range-filters small,small+large --rr-targets 1.0,1.5,2.0,3.0 --trade-direction-modes both,long_only,short_only
-
-Confronto multi-market:
-python main.py --period 60d --interval 5m --markets SP500,NASDAQ --force-close-options none --breakout-windows 10:30 --orb-range-filters small,small+large --rr-targets 1.0,1.5 --trade-direction-modes both,long_only,short_only
+Con audit mode attivo:
+python main.py --csv-path-sp500 data/sp500_5m.csv --csv-path-nasdaq data/nasdaq_5m.csv --csv-timezone UTC --markets SP500,NASDAQ --force-close-options none --breakout-windows 10:00,10:30 --orb-range-filters all,small,small+large --rr-targets 1.0,1.5 --trade-direction-modes both --audit-mode --audit-sample-days 10 --audit-trades-limit 20
